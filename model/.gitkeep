@@ -1,0 +1,3 @@
+# 此目录用于存放YOLOv11人脸检测模型权重文件
+# 请将 yolov11n-face.pt 下载后放置于此目录
+# 下载地址：https://github.com/ultralytics/assets/releases (查找yolov11n-face.pt)

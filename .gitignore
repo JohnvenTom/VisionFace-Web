@@ -1,0 +1,144 @@
+# ============================================================
+# VisionFace-Web .gitignore
+# 基于 YOLOv11 的 Web 人脸检测系统
+# ============================================================
+
+# ---------- Python ----------
+# 字节码与编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+venv/
+ENV/
+env/
+.venv/
+
+# 分发与打包
+dist/
+build/
+*.egg-info/
+*.egg
+eggs/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# 单元测试 /覆盖率
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+junit.xml
+
+# mypy 类型检查
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ruff 格式化检查
+.ruff_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# ---------- 模型权重（大文件） ----------
+# 预训练模型文件通常较大（几十MB到几百MB），不建议提交到Git
+# 如需版本控制请使用 Git LFS
+model/*.pt
+model/*.pth
+model/*.onnx
+model/*.engine
+
+# 保留 .gitkeep 以维持目录结构
+!model/.gitkeep
+
+# ---------- IDE / 编辑器 ----------
+# VS Code
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains 系列（PyCharm、WebStorm等）
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim
+*.swp
+*.swo
+*~
+Session.vim
+
+# Emacs
+*\#
+.\#*
+
+# ---------- 操作系统 ----------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ---------- 项目特定 ----------
+# 本地配置（含敏感信息）
+.env
+.env.local
+.env.*.local
+config.local.py
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+
+# 检测结果输出（可选）
+output/
+results/
+detected_uploads/
+
+# ---------- 数据集（如后续添加） ----------
+datasets/
+data/raw/
+data/processed/
