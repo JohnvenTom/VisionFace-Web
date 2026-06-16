@@ -202,7 +202,7 @@ async def detect_frame(request: DetectRequest):
 
     try:
         result = detector.detect_frame(
-            image=image,
+            frame=image,
             conf_threshold=request.conf_threshold,
             iou_threshold=request.iou_threshold
         )

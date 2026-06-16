@@ -102,6 +102,13 @@
                     摄像头控制
                 </h3>
                 <div class="camera-controls">
+                    <!-- 摄像头设备选择 -->
+                    <div class="camera-select-wrapper" id="cameraSelectWrapper">
+                        <label class="select-label">选择摄像头</label>
+                        <select id="cameraDeviceSelect" class="camera-device-select">
+                            <option value="">正在枚举设备...</option>
+                        </select>
+                    </div>
                     <button class="ctrl-btn primary" id="btnStartCamera">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                             <circle cx="12" cy="12" r="10"/>
