@@ -22,6 +22,10 @@ const CameraDetector = {
     canvas: null,
     /** @type {CanvasRenderingContext2D} 叠加画布渲染上下文 */
     ctx: null,
+    /** @type {HTMLSelectElement} 摄像头设备选择下拉框 */
+    selectEl: null,
+    /** @type {Array<MediaDeviceInfo>} 已枚举的视频输入设备列表 */
+    devices: [],
     /** @type {boolean} 摄像头是否开启 */
     isRunning: false,
     /** @type {boolean} 检测是否暂停 */
@@ -50,7 +54,8 @@ const CameraDetector = {
     /**
      * 初始化摄像头检测模块
      *
-     * 获取DOM元素引用，绑定按钮事件监听器，初始化Canvas尺寸。
+     * 获取DOM元素引用，绑定按钮事件监听器，初始化Canvas尺寸，
+     * 枚举可用摄像头设备并填充选择下拉框。
      *
      * @returns {void}
      *
@@ -58,11 +63,13 @@ const CameraDetector = {
      *   - 必须在DOM加载完成后调用
      *   - 按钮事件包括开启/关闭摄像头、暂停检测
      *   - 初始化时同步叠加Canvas的绘图缓冲区尺寸与容器一致
+     *   - 自动枚举摄像头设备，支持USB热插拔自动刷新列表
      */
     init() {
         this.video = document.getElementById('cameraVideo');
         this.canvas = document.getElementById('cameraCanvas');
         this.ctx = this.canvas.getContext('2d');
+        this.selectEl = document.getElementById('cameraDeviceSelect');
 
         // 监听容器尺寸变化，同步更新Canvas缓冲区尺寸（避免拉伸模糊）
         const container = document.getElementById('canvasContainer');
@@ -77,66 +84,181 @@ const CameraDetector = {
         document.getElementById('btnStartCamera').addEventListener('click', () => this.start());
         document.getElementById('btnStopCamera').addEventListener('click', () => this.stop());
         document.getElementById('btnPauseDetect').addEventListener('click', () => this.togglePause());
+
+        // 摄像头设备切换时提示用户重新开启
+        this.selectEl.addEventListener('change', () => {
+            if (this.isRunning) {
+                showToast('请先关闭当前摄像头再切换设备', 'warning');
+                // 回滚到当前使用的设备
+                this._restoreSelectToActive();
+            }
+        });
+
+        // 监听设备插拔变化（USB摄像头热插拔）
+        navigator.mediaDevices.addEventListener('devicechange', () => {
+            console.log('[Camera] 设备列表变化，重新枚举');
+            this.enumerateDevices();
+        });
+
+        // 初始枚举设备（需要先获取权限才能看到设备标签）
+        this.enumerateDevices();
+    },
+
+    /**
+     * 枚举系统可用的视频输入设备并更新下拉框
+     *
+     * 调用 enumerateDevices API 获取所有 videoinput 设备，
+     * 填充到选择下拉框中。首次调用时需先请求临时权限以获取设备标签。
+     *
+     * @returns {Promise<void>}
+     *
+     * @notes
+     *   - 首次枚举会临时请求摄像头权限以获取完整设备信息
+     *   - 设备按 label 排序显示，无标签的设备显示为"默认摄像头"
+     *   - 无可用设备时下拉框禁用并提示
+     */
+    async enumerateDevices() {
+        try {
+            // 首次调用需要先获取权限才能读取 device.label
+            if (!this._hasPermission) {
+                try {
+                    const tempStream = await navigator.mediaDevices.getUserMedia({
+                        video: true, audio: false
+                    });
+                    // 立即释放临时流，仅用于获取权限
+                    tempStream.getTracks().forEach(t => t.stop());
+                    this._hasPermission = true;
+                } catch (permErr) {
+                    // 权限被拒绝，仍尝试枚举（可能已有其他页面授权过）
+                    console.warn('[Camera] 临时权限请求失败:', permErr.name);
+                }
+            }
+
+            const allDevices = await navigator.mediaDevices.enumerateDevices();
+            this.devices = allDevices.filter(d => d.kind === 'videoinput');
+
+            // 更新下拉框选项
+            this.selectEl.innerHTML = '';
+
+            if (this.devices.length === 0) {
+                this.selectEl.innerHTML =
+                    '<option value="">未检测到摄像头</option>';
+                this.selectEl.disabled = true;
+                return;
+            }
+
+            this.selectEl.disabled = false;
+
+            // 按 label 排序：有名称的在前，无名称的在后
+            const sorted = [...this.devices].sort((a, b) => {
+                const la = a.label || '';
+                const lb = b.label || '';
+                if (!la && !lb) return 0;
+                if (!la) return 1;
+                if (!lb) return -1;
+                return la.localeCompare(lb);
+            });
+
+            sorted.forEach((device, index) => {
+                const option = document.createElement('option');
+                option.value = device.deviceId;
+                // 显示友好名称：优先使用label，无label则用默认名
+                option.textContent = device.label ||
+                    `摄像头 ${index + 1}`;
+                this.selectEl.appendChild(option);
+            });
+
+            console.log(`[Camera] 已枚举 ${this.devices.length} 个摄像头设备`);
+        } catch (error) {
+            console.error('[Camera] 设备枚举失败:', error);
+            this.selectEl.innerHTML =
+                '<option value="">设备枚举失败</option>';
+            this.selectEl.disabled = true;
+        }
+    },
+
+    /**
+     * 将下拉框选中项恢复到当前正在使用的设备
+     *
+     * 当用户在运行中切换设备时回滚选择，防止状态不一致。
+     *
+     * @returns {void}
+     */
+    _restoreSelectToActive() {
+        if (!this.stream) return;
+        const activeTrack = this.stream.getVideoTracks()[0];
+        if (activeTrack) {
+            this.selectEl.value = activeTrack.getSettings().deviceId || '';
+        }
     },
 
     /**
      * 开启摄像头并启动实时检测
      *
-     * 请求浏览器摄像头权限，获取视频流后启动逐帧检测循环。
+     * 使用用户选择的摄像头设备请求视频流，
+     * 获取视频流后启动逐帧检测循环。
      *
      * @returns {Promise<void>}
      * @throws 当摄像头权限被拒绝或设备不可用时通过Toast提示用户
      *
      * @notes
-     *   - 优先使用后置摄像头（移动端），桌面端默认前置
+     *   - 优先使用下拉框选择的指定设备（deviceId）
+     *   - 未选择或deviceId无效时回退到默认前置摄像头
      *   - 视频画面水平镜像显示
      *   - 检测帧率受detectInterval参数控制
      */
     async start() {
         if (this.isRunning) return;
 
+        // 构建视频约束：优先使用选定设备
+        const selectedDeviceId = this.selectEl.value;
+        const videoConstraints = {
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+        };
+
+        // 如果用户选择了具体设备，使用 deviceId 约束
+        if (selectedDeviceId) {
+            videoConstraints.deviceId = { exact: selectedDeviceId };
+        } else {
+            // 回退：默认使用前置摄像头
+            videoConstraints.facingMode = 'user';
+        }
+
         try {
             this.stream = await navigator.mediaDevices.getUserMedia({
-                video: {
-                    facingMode: 'user',
-                    width: { ideal: 640 },
-                    height: { ideal: 480 }
-                }
+                video: videoConstraints,
+                audio: false
             });
 
             this.video.srcObject = this.stream;
             await this.video.play();
 
             this.isRunning = true;
-            this.isPaused = false;
-            this.lastFrameTime = 0;
-            this.frameCount = 0;
-            this.fpsIntervalStart = performance.now();
-            this._hasShownError = false;
-
-            // 同步Canvas缓冲区尺寸与容器一致
-            const container = document.getElementById('canvasContainer');
-            this.canvas.width = container.clientWidth;
-            this.canvas.height = container.clientHeight;
-
-            // 更新UI状态
-            this.video.classList.remove('hidden');
-            this.canvas.classList.remove('hidden');
-            document.getElementById('emptyState').classList.add('hidden');
-            document.getElementById('scanLine').classList.remove('hidden');
-            document.getElementById('btnStartCamera').disabled = true;
-            document.getElementById('btnStopCamera').disabled = false;
-            document.getElementById('btnPauseDetect').disabled = false;
-
+            this._postStartInit();
             showToast('摄像头已开启', 'success');
-
-            // 启动检测循环
-            this.detectLoop();
         } catch (error) {
             if (error.name === 'NotAllowedError') {
                 showToast('摄像头权限被拒绝，请在浏览器设置中允许', 'error');
             } else if (error.name === 'NotFoundError') {
-                showToast('未检测到摄像头设备', 'error');
+                showToast('未检测到所选摄像头设备，请检查连接', 'error');
+            } else if (error.name === 'OverconstrainedError') {
+                showToast('所选摄像头不支持请求的分辨率，将尝试默认设置', 'warning');
+                // 回退：去掉精确约束重试一次
+                try {
+                    this.stream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: { ideal: 640 }, height: { ideal: 480 } },
+                        audio: false
+                    });
+                    this.video.srcObject = this.stream;
+                    await this.video.play();
+                    this.isRunning = true;
+                    // ... 重复后续初始化逻辑（简化处理）
+                    this._postStartInit();
+                    return;
+                } catch (retryErr) {
+                    showToast(`摄像头启动失败：${retryErr.message}`, 'error');
+                }
             } else {
                 showToast(`摄像头启动失败：${error.message}`, 'error');
             }
@@ -144,15 +266,49 @@ const CameraDetector = {
     },
 
     /**
+     * 开启后的通用初始化逻辑（避免start()中重复代码）
+     *
+     * @returns {void}
+     */
+    _postStartInit() {
+        this.isPaused = false;
+        this.lastFrameTime = 0;
+        this.frameCount = 0;
+        this.fpsIntervalStart = performance.now();
+        this._hasShownError = false;
+
+        // 同步Canvas缓冲区尺寸与容器一致
+        const container = document.getElementById('canvasContainer');
+        this.canvas.width = container.clientWidth;
+        this.canvas.height = container.clientHeight;
+
+        // 更新UI状态
+        this.video.classList.remove('hidden');
+        this.canvas.classList.remove('hidden');
+        document.getElementById('emptyState').classList.add('hidden');
+        document.getElementById('scanLine').classList.remove('hidden');
+        document.getElementById('btnStartCamera').disabled = true;
+        document.getElementById('btnStopCamera').disabled = false;
+        document.getElementById('btnPauseDetect').disabled = false;
+
+        // 锁定下拉框，防止运行中切换设备
+        this.selectEl.disabled = true;
+
+        this.detectLoop();
+    },
+
+    /**
      * 关闭摄像头并停止检测
      *
-     * 停止视频流、取消动画帧、清空画布、重置UI状态。
+     * 停止视频流、取消动画帧、清空画布、重置UI状态，
+     * 重新枚举可用摄像头设备（支持USB热插拔）。
      *
      * @returns {void}
      *
      * @notes
      *   - 会释放摄像头设备，其他应用可重新访问
      *   - 重置FPS显示为"--"
+     *   - 停止后自动刷新设备列表
      */
     stop() {
         if (!this.isRunning) return;
@@ -187,6 +343,10 @@ const CameraDetector = {
         document.getElementById('btnStopCamera').disabled = true;
         document.getElementById('btnPauseDetect').disabled = true;
         document.getElementById('fpsValue').textContent = '-- FPS';
+
+        // 解锁下拉框并重新枚举设备（支持热插拔）
+        this.selectEl.disabled = false;
+        this.enumerateDevices();
 
         showToast('摄像头已关闭', 'info');
     },

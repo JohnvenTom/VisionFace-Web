@@ -202,23 +202,40 @@ function updateStats(faceCount, inferenceTime, fps = null) {
     }
 }
 
+/** @type {string|null} 上一次渲染的检测结果摘要，用于防闪烁 */
+let _lastResultsHash = null;
+
 /**
  * 更新检测结果详情列表
- *
+
  * @param {Array<Object>} faces - 人脸信息列表
  * @returns {void}
  *
  * @notes
  *   - 每个人脸显示编号、置信度和边界框坐标
  *   - 列表为空时显示"暂无检测结果"占位文字
+ *   - 内置防抖机制：仅当数据实际变化时才更新DOM，避免高频重绘导致闪烁
  */
 function updateResultsList(faces) {
     const listEl = document.getElementById('resultsList');
 
     if (!faces || faces.length === 0) {
-        listEl.innerHTML = '<div class="results-empty">暂无检测结果</div>';
+        const emptyHtml = '<div class="results-empty">暂无检测结果</div>';
+        // 仅在内容变化时更新
+        if (_lastResultsHash !== '__empty__') {
+            listEl.innerHTML = emptyHtml;
+            _lastResultsHash = '__empty__';
+        }
         return;
     }
+
+    // 生成当前数据的轻量哈希（人脸数 + 各置信度取整），避免不必要的DOM重建
+    const hash = faces.length + '|' + faces.map(f => Math.round(f.confidence * 100)).join(',');
+
+    if (hash === _lastResultsHash) {
+        return; // 数据未变，跳过渲染
+    }
+    _lastResultsHash = hash;
 
     listEl.innerHTML = faces.map((face, i) => `
         <div class="result-item">
