@@ -453,19 +453,19 @@ const CameraDetector = {
 
         if (this.isPaused) {
             btn.innerHTML = `
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <polygon points="5 3 19 12 5 21 5 3"/>
                 </svg>
-                恢复检测`;
-            showToast('检测已暂停', 'warning');
+                Play`;
+            showToast('Detection paused', 'warning');
         } else {
             btn.innerHTML = `
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <rect x="6" y="4" width="4" height="16"/>
                     <rect x="14" y="4" width="4" height="16"/>
                 </svg>
-                暂停检测`;
-            showToast('检测已恢复', 'info');
+                Pause`;
+            showToast('Detection resumed', 'info');
         }
     },
 

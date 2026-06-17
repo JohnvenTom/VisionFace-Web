@@ -316,16 +316,19 @@ body::before {
     align-items: center;
     justify-content: center;
     gap: 6px;
-    padding: 9px 10px;
+    padding: 9px 8px;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-secondary);
     font-family: var(--font-body);
-    font-size: 12.5px;
+    font-size: 12px;
     font-weight: 600;
     cursor: pointer;
     transition: all .2s;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
 }
 .btn:disabled { opacity: .35; cursor: not-allowed; }
 
