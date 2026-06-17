@@ -1,8 +1,15 @@
-ultralytics>=8.3.0
-fastapi>=0.104.0
-uvicorn>=0.24.0
-opencv-python>=4.8.0
-numpy>=1.24.0
-pillow>=10.0.0
-python-multipart>=0.0.6
-pydantic>=2.0.0
+# ---------- 核心依赖 ----------
+ultralytics>=8.3.0          # YOLO模型训练与推理（含PyTorch）
+fastapi>=0.104.0            # Web框架
+uvicorn>=0.24.0             # ASGI服务器
+opencv-python>=4.8.0        # 图像处理
+numpy>=1.24.0               # 数值计算
+pillow>=10.0.0              # 图像读写
+python-multipart>=0.0.6     # 文件上传支持
+pydantic>=2.0.0             # 数据验证
+
+# ---------- 训练可选依赖（pip install -r requirements.txt 自动安装） ----------
+psutil>=5.9.0               # 系统资源监控（训练时显示GPU/CPU状态）
+seaborn>=0.13.0             # 训练曲线可视化
+matplotlib>=3.8.0           # 结果图表绘制
+scipy>=1.11.0               # 科学计算（NMS等）
