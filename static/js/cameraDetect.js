@@ -79,14 +79,11 @@ const CameraDetector = {
         this.ctx = this.canvas.getContext('2d');
         this.selectEl = document.getElementById('cameraDeviceSelect');
 
-        // 监听容器尺寸变化，同步更新Canvas缓冲区尺寸并刷新显示缓存
+        // Watch container size changes, re-sync canvas overlay to video position
         const container = document.getElementById('canvasContainer');
         this._resizeObserver = new ResizeObserver(() => {
             if (container.clientWidth > 0 && container.clientHeight > 0) {
-                this.canvas.width = container.clientWidth;
-                this.canvas.height = container.clientHeight;
-                // 标记显示缓存失效（下次检测帧时重新计算）
-                this._displayCache = null;
+                this._syncOverlayToVideo();
             }
         });
         this._resizeObserver.observe(container);
@@ -349,21 +346,17 @@ const CameraDetector = {
         this.fpsIntervalStart = performance.now();
         this._hasShownError = false;
 
-        // 缓存容器DOM引用
+        // Cache container DOM reference
         this._containerEl = document.getElementById('canvasContainer');
 
-        // 同步Canvas缓冲区尺寸与容器一致
-        this.canvas.width = this._containerEl.clientWidth;
-        this.canvas.height = this._containerEl.clientHeight;
-
-        // 创建复用的临时截图Canvas（避免每帧 createElement + getContext）
+        // Create reusable temp canvas for screenshot capture
         this._tempCanvas = document.createElement('canvas');
         this._tempCtx = this._tempCanvas.getContext('2d');
 
-        // 初始化显示尺寸缓存
-        this._updateDisplayCache();
+        // Sync canvas overlay to exactly match video's rendered position & size
+        this._syncOverlayToVideo();
 
-        // 更新UI状态
+        // Update UI state
         this.video.classList.remove('hidden');
         this.canvas.classList.remove('hidden');
         document.getElementById('emptyState').classList.add('hidden');
@@ -372,7 +365,7 @@ const CameraDetector = {
         document.getElementById('btnStopCamera').disabled = false;
         document.getElementById('btnPauseDetect').disabled = false;
 
-        // 锁定下拉框，防止运行中切换设备
+        // Lock select dropdown while running
         this.selectEl.disabled = true;
 
         this.detectLoop();
@@ -510,44 +503,51 @@ const CameraDetector = {
     },
 
     /**
-     * 更新容器显示尺寸缓存
+     * Sync canvas overlay position & dimensions to exactly match the video element's rendered area
      *
-     * 预计算视频在容器中的显示尺寸、偏移量和缩放比例，
-     * 缓存结果供 detectFrame 每帧直接读取，避免重复 DOM 查询和浮点运算。
+     * Uses getBoundingClientRect() to measure where the browser actually renders the video
+     * within its container (accounting for object-fit: contain, borders, padding, etc.).
+     * Then positions the overlay canvas directly on top of the video with identical pixel dimensions.
+     *
+     * This eliminates all offset/scale calculation mismatches between CSS layout and JS math.
      *
      * @returns {void}
-     *
-     * @notes
-     *   - 在 _postStartInit 初始化时调用一次
-     *   - ResizeObserver 标记缓存失效后，下次 detectFrame 时重新计算
      */
-    _updateDisplayCache() {
-        const cw = this._containerEl.clientWidth;
-        const ch = this._containerEl.clientHeight;
+    _syncOverlayToVideo() {
+        if (!this.video || !this.canvas || !this._containerEl) return;
+
+        const containerRect = this._containerEl.getBoundingClientRect();
+        const videoRect = this.video.getBoundingClientRect();
+
+        // Video position relative to container
+        const left = videoRect.left - containerRect.left;
+        const top = videoRect.top - containerRect.top;
+        const width = videoRect.width;
+        const height = videoRect.height;
+
+        // Position canvas exactly over the video element
+        this.canvas.style.position = 'absolute';
+        this.canvas.style.left = `${left}px`;
+        this.canvas.style.top = `${top}px`;
+        this.canvas.style.width = `${width}px`;
+        this.canvas.style.height = `${height}px`;
+        this.canvas.style.inset = 'auto'; // Override CSS inset:0
+
+        // Set canvas buffer to match rendered pixels (1:1 with display)
+        const dpr = window.devicePixelRatio || 1;
+        this.canvas.width = Math.round(width * dpr);
+        this.canvas.height = Math.round(height * dpr);
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // Scale for HiDPI
+
+        // Cache scale factors for coordinate conversion (video intrinsic → display)
         const vw = this.video.videoWidth || 640;
         const vh = this.video.videoHeight || 480;
-        const videoAspect = vw / vh;
-        const containerAspect = cw / ch;
-
-        let displayW, displayH, offsetX, offsetY;
-        if (videoAspect > containerAspect) {
-            displayW = cw;
-            displayH = cw / videoAspect;
-            offsetX = 0;
-            offsetY = (ch - displayH) / 2;
-        } else {
-            displayH = ch;
-            displayW = ch * videoAspect;
-            offsetX = (cw - displayW) / 2;
-            offsetY = 0;
-        }
 
         this._displayCache = {
-            containerW: cw,
-            containerH: ch,
-            displayW, displayH, offsetX, offsetY,
-            scaleX: displayW / vw,
-            scaleY: displayH / vh
+            displayW: width,
+            displayH: height,
+            scaleX: width / vw,
+            scaleY: height / vh
         };
     },
 
@@ -569,29 +569,29 @@ const CameraDetector = {
         if (!this.video.videoWidth || !this.video.videoHeight) return;
 
         try {
-            // === 1. 复用临时Canvas截图（不再每帧新建） ===
+            // === 1. Reuse temp canvas for screenshot capture ===
             const tc = this._tempCanvas;
             tc.width = this.video.videoWidth;
             tc.height = this.video.videoHeight;
             this._tempCtx.drawImage(this.video, 0, 0);
 
-            // === 2. JPEG编码（质量0.7：速度优先） ===
+            // === 2. JPEG encode (quality 0.7: speed priority) ===
             const blob = await new Promise((resolve) => {
                 tc.toBlob(resolve, 'image/jpeg', 0.7);
             });
             if (!blob) return;
 
-            // === 3. 通过WebSocket发送并 await 等待对应结果 ===
+            // === 3. Send via WebSocket and await corresponding result ===
             const result = await WSDetectClient.sendFrame(blob);
 
-            // === 4. 获取/刷新显示尺寸缓存 ===
+            // === 4. Refresh display cache if stale (syncs overlay to video) ===
             if (!this._displayCache) {
-                this._updateDisplayCache();
+                this._syncOverlayToVideo();
             }
             const dc = this._displayCache;
 
-            // === 5. 清空叠加层并绘制检测结果 ===
-            this.ctx.clearRect(0, 0, dc.containerW, dc.containerH);
+            // === 5. Clear overlay and draw detection results ===
+            this.ctx.clearRect(0, 0, dc.displayW, dc.displayH);
 
             if (result.faces && result.faces.length > 0) {
                 for (let i = 0; i < result.faces.length; i++) {
@@ -603,20 +603,20 @@ const CameraDetector = {
                     let sw = (x2 - x1) * dc.scaleX;
                     let sh = (y2 - y1) * dc.scaleY;
 
-                    // X轴镜像翻转（视频CSS做了scaleX(-1)）
-                    sx = dc.offsetX + dc.displayW - (sx + sw);
+                    // X-axis mirror flip (video CSS has scaleX(-1))
+                    sx = dc.displayW - (sx + sw);
 
                     this._drawSingleBox(sx, sy, sw, sh, face.confidence, i);
                 }
             }
 
-            // 更新统计信息
+            // Update statistics
             updateStats(result.count, result.inference_time, this.currentFps);
             updateResultsList(result.faces);
         } catch (error) {
             if (!this._hasShownError) {
                 this._hasShownError = true;
-                showToast(`检测异常: ${error.message}`, 'error', 5000);
+                showToast(`Detection error: ${error.message}`, 'error', 5000);
                 setTimeout(() => { this._hasShownError = false; }, 5000);
             }
         }
