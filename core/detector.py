@@ -229,6 +229,7 @@ class FaceDetector:
                 source=image_rgb,
                 conf=conf_threshold,
                 iou=iou_threshold,
+                max_det=300,
                 device=self.device,
                 verbose=False
             )
