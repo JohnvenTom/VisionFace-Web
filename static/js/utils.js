@@ -204,46 +204,74 @@ function updateStats(faceCount, inferenceTime, fps = null) {
 
 /** @type {string|null} 上一次渲染的检测结果摘要，用于防闪烁 */
 let _lastResultsHash = null;
+/** @type {Array<HTMLElement>|null} 缓存的结果卡片DOM元素数组 */
+let _resultCards = null;
 
 /**
- * 更新检测结果详情列表
-
- * @param {Array<Object>} faces - 人脸信息列表
+ * 更新检测结果详情列表（就地更新模式，避免DOM重建闪烁）
+ *
+ * 首次调用时创建卡片DOM结构，后续调用仅更新文本内容，
+ * 保持卡片DOM稳定，仅刷新数值，消除视觉闪烁。
+ *
+ * @param {Array<Object>} faces - 人脸信息列表，每项包含bbox([x1,y1,x2,y2])和confidence
  * @returns {void}
  *
  * @notes
  *   - 每个人脸显示编号、置信度和边界框坐标
  *   - 列表为空时显示"暂无检测结果"占位文字
- *   - 内置防抖机制：仅当数据实际变化时才更新DOM，避免高频重绘导致闪烁
+ *   - 使用就地更新策略：首次innerHTML创建，后续textContent更新
+ *   - 人脸数量变化时才重建DOM，否则只更新数值
  */
 function updateResultsList(faces) {
     const listEl = document.getElementById('resultsList');
 
+    // 空结果处理
     if (!faces || faces.length === 0) {
-        const emptyHtml = '<div class="results-empty">暂无检测结果</div>';
-        // 仅在内容变化时更新
         if (_lastResultsHash !== '__empty__') {
-            listEl.innerHTML = emptyHtml;
+            listEl.innerHTML = '<div class="results-empty">暂无检测结果</div>';
             _lastResultsHash = '__empty__';
+            _resultCards = null;
         }
         return;
     }
 
-    // 生成当前数据的轻量哈希（人脸数 + 各置信度取整），避免不必要的DOM重建
-    const hash = faces.length + '|' + faces.map(f => Math.round(f.confidence * 100)).join(',');
+    // 人脸数量变化 → 需要重建DOM
+    const faceCount = faces.length;
+    if (!_resultCards || _resultCards.length !== faceCount) {
+        // 构建新的卡片HTML
+        listEl.innerHTML = faces.map((_, i) => `
+            <div class="result-item">
+                <span class="face-id">FACE-${String(i + 1).padStart(2, '0')}</span>
+                <span class="face-conf"></span>
+                <span class="face-bbox"></span>
+            </div>
+        `).join('');
 
-    if (hash === _lastResultsHash) {
-        return; // 数据未变，跳过渲染
+        // 缓存卡片元素引用
+        _resultCards = Array.from(listEl.children);
+        _lastResultsHash = null;  // 强制首次数值填充
     }
-    _lastResultsHash = hash;
 
-    listEl.innerHTML = faces.map((face, i) => `
-        <div class="result-item">
-            <span class="face-id">FACE-${String(i + 1).padStart(2, '0')}</span>
-            <span class="face-conf">${(face.confidence * 100).toFixed(1)}%</span>
-            <span class="face-bbox">[${face.bbox.map(v => Math.round(v)).join(', ')}]</span>
-        </div>
-    `).join('');
+    // === 就地更新每个卡片的数值（不重建DOM） ===
+    let hash = faceCount + '|';
+    for (let i = 0; i < faceCount; i++) {
+        const face = faces[i];
+        const confStr = (face.confidence * 100).toFixed(1) + '%';
+        const bboxStr = '[' + face.bbox.map(v => Math.round(v)).join(', ') + ']';
+
+        // 更新文本内容（不触发DOM重建）
+        const card = _resultCards[i];
+        card.querySelector('.face-conf').textContent = confStr;
+        card.querySelector('.face-bbox').textContent = bboxStr;
+
+        // 累加哈希用于检测是否有实际变化
+        hash += Math.round(face.confidence * 100) + ',';
+    }
+
+    // 记录哈希用于下次对比
+    if (hash !== _lastResultsHash) {
+        _lastResultsHash = hash;
+    }
 }
 
 
@@ -252,11 +280,11 @@ function updateResultsList(faces) {
 // ============================================================
 
 /**
- * WebSocket检测连接管理器
+ * WebSocket检测连接管理器（请求-应答配对模式）
  *
- * 封装WebSocket连接的完整生命周期，包括连接建立、二进制帧发送、
- * 结果接收解析、断线重连、参数动态更新等功能。
- * 替代原有的HTTP POST轮询模式，大幅降低每帧传输开销。
+ * 封装WebSocket连接的完整生命周期，核心特点是 sendFrame() 返回 Promise，
+ * 每次发送帧后会 await 等待对应的结果返回，保持发送-接收的严格顺序。
+ * 这确保检测结果与发送的帧一一对应，不会出现乱序或闪烁。
  *
  * @namespace WSDetectClient
  *
@@ -264,8 +292,9 @@ function updateResultsList(faces) {
  * // 开启摄像头时连接
  * await WSDetectClient.connect();
  *
- * // 发送帧数据（Blob格式）
- * WSDetectClient.sendFrame(blob);
+ * // 发送帧并等待结果（请求-应答配对）
+ * const result = await WSDetectClient.sendFrame(blob);
+ * console.log(result.count); // 人脸数量
  *
  * // 更新检测参数
  * WSDetectClient.updateConfig(0.6, 0.5);
@@ -280,10 +309,10 @@ const WSDetectClient = {
     _url: '',
     /** @type {boolean} 是否已连接 */
     connected: false,
-    /** @type {Function|null} 检测结果回调函数 */
-    _onResult: null,
-    /** @type {Function|null} 错误回调函数 */
+    /** @type {Function|null} 错误回调函数（用于连接级错误） */
     _onError: null,
+    /** @type {Array<{resolve: Function, reject: Function}>} 待处理的请求队列 */
+    _pending: [],
     /** @type {number} 自动重连最大次数 */
     _maxRetries: 3,
     /** @type {number} 当前重连计数 */
@@ -292,34 +321,31 @@ const WSDetectClient = {
     _retryBaseDelay: 1000,
 
     /**
-     * 建立WebSocket连接并注册回调
+     * 建立WebSocket连接
      *
      * 创建到后端 /ws/detect 端点的持久连接，
-     * 连接成功后自动发送初始配置消息。
+     * 连接成功后标记为可用状态。
      *
      * @param {Object} [options] - 连接选项
-     * @param {Function} [options.onResult] - 接收到检测结果时的回调，参数为解析后的结果对象
-     * @param {Function} [options.onError] - 发生错误时的回调，参数为错误信息字符串
-     * @param {string} [options.url] - 自定义WebSocket地址，默认从当前页面协议/主机推导
+     * @param {Function} [options.onError] - 发生连接级错误时的回调
+     * @param {string} [options.url] - 自定义WebSocket地址
      * @returns {Promise<void>}
      * @throws {Error} 当连接失败且重试耗尽时抛出异常
      *
      * @notes
      *   - 自动根据当前页面协议选择 ws:// 或 wss://
-     *   - 连接成功后立即发送默认阈值配置
      *   - 已有活跃连接时会先断开旧连接
      *   - 支持指数退避自动重连（最多3次）
+     *   - 清空待处理队列，避免残留的过期 Promise
      */
     async connect(options = {}) {
-        this._onResult = options.onResult || null;
         this._onError = options.onError || null;
+        this._pending = [];  // 清空残留队列
 
-        // 如果已有连接，先关闭
         if (this._ws && (this._ws.readyState === WebSocket.OPEN || this._ws.readyState === WebSocket.CONNECTING)) {
             this.disconnect();
         }
 
-        // 构建WebSocket URL：同源部署下从当前页面地址推导
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         this._url = options.url || `${protocol}//${location.host}/ws/detect`;
 
@@ -331,7 +357,7 @@ const WSDetectClient = {
                 return;
             }
 
-            this._ws.binaryType = 'arraybuffer';  // 关键：以二进制形式接收
+            this._ws.binaryType = 'arraybuffer';
 
             this._ws.onopen = () => {
                 console.log('[WS] 连接已建立:', this._url);
@@ -340,95 +366,124 @@ const WSDetectClient = {
                 resolve();
             };
 
+            /**
+             * 处理服务端消息，实现请求-应答配对
+             *
+             * 收到检测结果时，从_pending队列中取出最早的一个 Promise 并 resolve，
+             * 确保每个 sendFrame() 调用都能拿到对应的、正确顺序的结果。
+             */
             this._ws.onmessage = (event) => {
-                if (typeof event.data === 'string') {
-                    // 文本消息：JSON格式的检测结果或错误/确认消息
-                    try {
-                        const msg = JSON.parse(event.data);
+                if (typeof event.data !== 'string') return;
 
-                        if (msg.type === 'error') {
-                            console.warn('[WS] 服务端错误:', msg.detail);
-                            if (this._onError) this._onError(msg.detail);
-                            return;
+                try {
+                    const msg = JSON.parse(event.data);
+
+                    // 配置确认消息：不消耗 pending 队列
+                    if (msg.type === 'config_ack') {
+                        console.log('[WS] 配置已更新');
+                        return;
+                    }
+
+                    // 错误消息：reject 最旧的 pending 请求
+                    if (msg.type === 'error') {
+                        console.warn('[WS] 服务端错误:', msg.detail);
+                        const pending = this._pending.shift();
+                        if (pending) {
+                            pending.reject(new Error(msg.detail));
+                        } else if (this._onError) {
+                            this._onError(msg.detail);
                         }
+                        return;
+                    }
 
-                        if (msg.type === 'config_ack') {
-                            console.log('[WS] 配置已更新:', msg);
-                            return;
-                        }
-
-                        // 默认：检测结果数据
-                        if (this._onResult) this._onResult(msg);
-                    } catch (parseErr) {
-                        console.warn('[WS] 消息解析失败:', parseErr);
+                    // 正常检测结果：resolve 最旧的 pending 请求
+                    const pending = this._pending.shift();
+                    if (pending) {
+                        pending.resolve(msg);
+                    }
+                } catch (parseErr) {
+                    console.warn('[WS] 消息解析失败:', parseErr);
+                    // 解析失败也释放一个 pending，避免死等
+                    const pending = this._pending.shift();
+                    if (pending) {
+                        pending.reject(parseErr);
                     }
                 }
             };
 
-            this._ws.onerror = (event) => {
-                console.error('[WS] 连接错误:', event);
-                // onclose会紧随其后触发，在那里处理重连逻辑
+            this._ws.onerror = () => {
+                // onclose 会紧随其后触发
             };
 
             this._ws.onclose = (event) => {
                 this.connected = false;
-                console.log(`[WS] 连接已关闭, code=${event.code}, reason=${event.reason}`);
+                console.log(`[WS] 连接已关闭, code=${event.code}`);
 
-                // 非正常关闭且未达到重连上限 → 尝试重连
+                // reject 所有 pending 中的等待者
+                while (this._pending.length > 0) {
+                    const p = this._pending.shift();
+                    p.reject(new Error('WebSocket连接已断开'));
+                }
+
+                // 自动重连
                 if (event.code !== 1000 && this._retryCount < this._maxRetries) {
                     this._retryCount++;
                     const delay = this._retryBaseDelay * Math.pow(2, this._retryCount - 1);
-                    console.log(`[WS] 将在 ${delay}ms 后尝试第 ${this._retryCount} 次重连...`);
+                    console.log(`[WS] ${delay}ms 后第 ${this._retryCount} 次重连...`);
                     setTimeout(() => this.connect(options), delay);
-                } else if (this._retryCount >= this._maxRetries) {
-                    const errMsg = `WebSocket连接失败，已重试${this._maxRetries}次`;
-                    console.error('[WS]', errMsg);
-                    if (this._onError) this._onError(errMsg);
+                } else if (this._retryCount >= this._maxRetries && this._onError) {
+                    this._onError(`WebSocket连接失败，已重试${this._maxRetries}次`);
                 }
             };
         });
     },
 
     /**
-     * 通过WebSocket发送二进制图像帧
+     * 发送二进制图像帧并等待检测结果（请求-应答配对）
      *
-     * 将Canvas捕获的Blob数据直接通过WebSocket二进制帧发送，
-     * 无需Base64编码，消除约33%的数据膨胀。
+     * 将Blob数据通过WebSocket发送后返回一个Promise，
+     * Promise 在收到对应的检测结果时 resolve。
+     * 调用方通过 await 保持发送-接收的严格顺序。
      *
-     * @param {Blob|ArrayBuffer} frameData - 图像帧的二进制数据（推荐JPEG Blob）
-     * @returns {boolean} 发送成功返回true，连接未就绪返回false
+     * @param {Blob|ArrayBuffer} frameData - 图像帧二进制数据（JPEG Blob）
+     * @returns {Promise<Object>} 检测结果对象，包含 faces/count/inference_time 等
+     * @throws {Error} 连接未就绪或服务端返回错误时抛出异常
      *
      * @notes
-     *   - 仅在 connected 状态为 true 时才发送
-     *   - 前端应使用 canvas.toBlob('image/jpeg', 0.8) 获取压缩后的二进制数据
-     *   - 发送失败时静默处理，不中断调用方流程
+     *   - 必须在 connected=true 时调用
+     *   - 内部维护 FIFO 队列保证请求-响应严格配对
+     *   - 多个并发调用会按发送顺序依次返回结果
+     *   - 连接断开时会 reject 所有等待中的 Promise
      */
     sendFrame(frameData) {
-        if (!this.connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) {
-            return false;
-        }
-        try {
-            this._ws.send(frameData);
-            return true;
-        } catch (err) {
-            console.warn('[WS] 帧发送失败:', err.message);
-            return false;
-        }
+        return new Promise((resolve, reject) => {
+            if (!this.connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) {
+                reject(new Error('WebSocket未连接'));
+                return;
+            }
+
+            // 将 Promise 的 resolve/reject 加入待处理队列
+            this._pending.push({ resolve, reject });
+
+            try {
+                this._ws.send(frameData);
+            } catch (err) {
+                // 发送失败，立即移除并 reject
+                this._pending.pop();
+                reject(err);
+            }
+        });
     },
 
     /**
      * 动态更新检测参数（无需断开重连）
      *
      * 通过发送配置文本消息实时调整置信度和IoU阈值，
-     * 服务端收到后对后续帧生效。
+     * 服务端收到后对后续帧生效。此方法为 fire-and-forget 模式。
      *
      * @param {number} confThreshold - 置信度阈值，范围0.1-0.9
      * @param {number} iouThreshold - NMS IoU阈值，范围0.1-0.9
      * @returns {boolean} 发送成功返回true
-     *
-     * @notes
-     *   - 参数变更即时生效，无需等待下一帧
-     *   - 服务端会回复 config_ack 确认消息
      */
     updateConfig(confThreshold, iouThreshold) {
         if (!this.connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) {
@@ -448,28 +503,26 @@ const WSDetectClient = {
     },
 
     /**
-     * 断开WebSocket连接
-     *
-     * 主动关闭连接并释放资源，停止所有重连尝试。
+     * 断开WebSocket连接并清理资源
      *
      * @returns {void}
-     *
-     * @notes
-     *   - 调用后会清除回调引用和重连计数
-     *   - 应在摄像头关闭时调用，避免资源泄漏
      */
     disconnect() {
         this._retryCount = this._maxRetries;  // 阻止自动重连
+
+        // reject 所有 pending
+        while (this._pending.length > 0) {
+            const p = this._pending.shift();
+            p.reject(new Error('连接已主动断开'));
+        }
+
         if (this._ws) {
             try {
                 this._ws.close(1000, '客户端主动断开');
-            } catch (e) {
-                // 忽略已关闭的连接
-            }
+            } catch (e) { /* ignore */ }
             this._ws = null;
         }
         this.connected = false;
-        this._onResult = null;
         this._onError = null;
         console.log('[WS] 连接已释放');
     }
