@@ -7,6 +7,7 @@ numpy>=1.24.0               # 数值计算
 pillow>=10.0.0              # 图像读写
 python-multipart>=0.0.6     # 文件上传支持
 pydantic>=2.0.0             # 数据验证
+websockets>=12.0            # WebSocket通信（摄像头实时检测）
 
 # ---------- 训练可选依赖（pip install -r requirements.txt 自动安装） ----------
 psutil>=5.9.0               # 系统资源监控（训练时显示GPU/CPU状态）

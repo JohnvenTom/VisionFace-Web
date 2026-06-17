@@ -85,6 +85,26 @@ const CameraDetector = {
         document.getElementById('btnStopCamera').addEventListener('click', () => this.stop());
         document.getElementById('btnPauseDetect').addEventListener('click', () => this.togglePause());
 
+        // 检测参数滑块变化时，通过WebSocket动态推送新阈值（替代每帧读取）
+        const confSlider = document.getElementById('confSlider');
+        const iouSlider = document.getElementById('iouSlider');
+        confSlider.addEventListener('input', () => {
+            if (this.isRunning && WSDetectClient.connected) {
+                WSDetectClient.updateConfig(
+                    parseFloat(confSlider.value),
+                    parseFloat(iouSlider.value)
+                );
+            }
+        });
+        iouSlider.addEventListener('input', () => {
+            if (this.isRunning && WSDetectClient.connected) {
+                WSDetectClient.updateConfig(
+                    parseFloat(confSlider.value),
+                    parseFloat(iouSlider.value)
+                );
+            }
+        });
+
         // 摄像头设备切换时提示用户重新开启
         this.selectEl.addEventListener('change', () => {
             if (this.isRunning) {
@@ -134,6 +154,9 @@ const CameraDetector = {
                 }
             }
 
+            // 记录当前用户选中的 deviceId，用于枚举完成后恢复选中状态
+            const previousSelectedId = this.selectEl.value;
+
             const allDevices = await navigator.mediaDevices.enumerateDevices();
             this.devices = allDevices.filter(d => d.kind === 'videoinput');
 
@@ -168,6 +191,16 @@ const CameraDetector = {
                 this.selectEl.appendChild(option);
             });
 
+            // 恢复用户之前的选中项（如果该设备仍存在于列表中）
+            if (previousSelectedId) {
+                const exists = [...this.selectEl.options].some(
+                    opt => opt.value === previousSelectedId
+                );
+                if (exists) {
+                    this.selectEl.value = previousSelectedId;
+                }
+            }
+
             console.log(`[Camera] 已枚举 ${this.devices.length} 个摄像头设备`);
         } catch (error) {
             console.error('[Camera] 设备枚举失败:', error);
@@ -196,7 +229,7 @@ const CameraDetector = {
      * 开启摄像头并启动实时检测
      *
      * 使用用户选择的摄像头设备请求视频流，
-     * 获取视频流后启动逐帧检测循环。
+     * 建立WebSocket持久连接后启动逐帧检测循环。
      *
      * @returns {Promise<void>}
      * @throws 当摄像头权限被拒绝或设备不可用时通过Toast提示用户
@@ -206,6 +239,7 @@ const CameraDetector = {
      *   - 未选择或deviceId无效时回退到默认前置摄像头
      *   - 视频画面水平镜像显示
      *   - 检测帧率受detectInterval参数控制
+     *   - 通过WebSocket二进制帧传输替代HTTP轮询，大幅降低延迟和带宽开销
      */
     async start() {
         if (this.isRunning) return;
@@ -234,9 +268,26 @@ const CameraDetector = {
             this.video.srcObject = this.stream;
             await this.video.play();
 
+            // 建立WebSocket连接（替代HTTP轮询）
+            await WSDetectClient.connect({
+                onResult: (result) => this._handleWSResult(result),
+                onError: (errMsg) => {
+                    if (!this._hasShownError) {
+                        this._hasShownError = true;
+                        showToast(`检测异常: ${errMsg}`, 'error', 5000);
+                        setTimeout(() => { this._hasShownError = false; }, 5000);
+                    }
+                }
+            });
+
+            // 发送初始配置（置信度 + IoU阈值）
+            const conf = parseFloat(document.getElementById('confSlider').value);
+            const iou = parseFloat(document.getElementById('iouSlider').value);
+            WSDetectClient.updateConfig(conf, iou);
+
             this.isRunning = true;
             this._postStartInit();
-            showToast('摄像头已开启', 'success');
+            showToast('摄像头已开启 (WebSocket模式)', 'success');
         } catch (error) {
             if (error.name === 'NotAllowedError') {
                 showToast('摄像头权限被拒绝，请在浏览器设置中允许', 'error');
@@ -252,8 +303,23 @@ const CameraDetector = {
                     });
                     this.video.srcObject = this.stream;
                     await this.video.play();
+
+                    // 建立WebSocket连接（回退路径也需要）
+                    await WSDetectClient.connect({
+                        onResult: (result) => this._handleWSResult(result),
+                        onError: (errMsg) => {
+                            if (!this._hasShownError) {
+                                this._hasShownError = true;
+                                showToast(`检测异常: ${errMsg}`, 'error', 5000);
+                                setTimeout(() => { this._hasShownError = false; }, 5000);
+                            }
+                        }
+                    });
+                    const conf = parseFloat(document.getElementById('confSlider').value);
+                    const iou = parseFloat(document.getElementById('iouSlider').value);
+                    WSDetectClient.updateConfig(conf, iou);
+
                     this.isRunning = true;
-                    // ... 重复后续初始化逻辑（简化处理）
                     this._postStartInit();
                     return;
                 } catch (retryErr) {
@@ -300,18 +366,22 @@ const CameraDetector = {
     /**
      * 关闭摄像头并停止检测
      *
-     * 停止视频流、取消动画帧、清空画布、重置UI状态，
+     * 停止视频流、断开WebSocket连接、取消动画帧、清空画布、重置UI状态，
      * 重新枚举可用摄像头设备（支持USB热插拔）。
      *
      * @returns {void}
      *
      * @notes
      *   - 会释放摄像头设备，其他应用可重新访问
+     *   - 断开WebSocket持久连接释放服务端资源
      *   - 重置FPS显示为"--"
      *   - 停止后自动刷新设备列表
      */
     stop() {
         if (!this.isRunning) return;
+
+        // 断开WebSocket连接
+        WSDetectClient.disconnect();
 
         // 停止视频流
         if (this.stream) {
@@ -421,24 +491,21 @@ const CameraDetector = {
     },
 
     /**
-     * 捕获当前视频帧并发送检测请求
+     * 捕获当前视频帧并通过WebSocket二进制发送
      *
-     * 将视频帧绘制到临时Canvas转为Base64，发送至后端推理，
-     * 接收结果后在叠加Canvas上绘制检测框。
+     * 使用canvas.toBlob()获取压缩后的JPEG二进制数据，
+     * 直接通过WebSocket发送，无需Base64编码。
+     * 检测结果通过异步回调(_handleWSResult)接收并绘制。
      *
-     * 坐标映射说明：
-     *   - 视频通过 CSS scaleX(-1) 镜像显示（用户看到的是镜像画面）
-     *   - 但 drawImage() 捕获的是未镜像的原始像素数据
-     *   - 后端基于原始像素检测，返回原始坐标系中的bbox
-     *   - 绘制时需将 x 坐标镜像翻转：mirrorX = displayW - (x * scaleX)
-     *
-     * @returns {Promise<void>}
+     * @returns {void}
      *
      * @notes
      *   - 使用临时Canvas进行帧捕获，避免影响显示Canvas
-     *   - 检测失败时静默处理，不中断检测循环
+     *   - toBlob是异步操作，内部回调中调用WSDetectClient.sendFrame()
+     *   - 发送失败时静默处理，不中断检测循环
+     *   - 参数(conf/iou)通过WebSocket配置消息动态更新，不再每帧读取
      */
-    async detectFrame() {
+    detectFrame() {
         if (!this.video.videoWidth || !this.video.videoHeight) return;
 
         this.isDetecting = true;
@@ -451,86 +518,109 @@ const CameraDetector = {
             const tempCtx = tempCanvas.getContext('2d');
             tempCtx.drawImage(this.video, 0, 0);
 
-            // 转Base64
-            const base64 = tempCanvas.toDataURL('image/jpeg', 0.8);
+            // 转为Blob（二进制），替代Base64编码 —— 消除~33%数据膨胀
+            tempCanvas.toBlob(
+                (blob) => {
+                    if (!blob) {
+                        this.isDetecting = false;
+                        return;
+                    }
+                    // 通过WebSocket发送二进制帧（fire-and-forget）
+                    const sent = WSDetectClient.sendFrame(blob);
+                    this.isDetecting = false;
 
-            // 获取参数
-            const conf = parseFloat(document.getElementById('confSlider').value);
-            const iou = parseFloat(document.getElementById('iouSlider').value);
-
-            // 发送检测请求
-            const result = await detectRequest('/api/detect/frame', base64, conf, iou);
-
-            // 调试日志：确认后端是否返回了检测结果
-            console.log('[Camera] 检测结果:', result.count, '张人脸', result.faces?.length > 0 ? result.faces : '无');
-
-            // === 计算视频在容器中的实际显示尺寸和偏移 ===
-            const container = document.getElementById('canvasContainer');
-            const containerW = container.clientWidth;
-            const containerH = container.clientHeight;
-            const videoAspect = this.video.videoWidth / this.video.videoHeight;
-            const containerAspect = containerW / containerH;
-
-            let displayW, displayH, offsetX, offsetY;
-            if (videoAspect > containerAspect) {
-                // 视频更宽：以容器宽度为准，高度留白
-                displayW = containerW;
-                displayH = containerW / videoAspect;
-                offsetX = 0;
-                offsetY = (containerH - displayH) / 2;
-            } else {
-                // 视频更高：以容器高度为准，宽度留白
-                displayH = containerH;
-                displayW = containerH * videoAspect;
-                offsetX = (containerW - displayW) / 2;
-                offsetY = 0;
-            }
-
-            // 缩放比例：原图坐标 → 显示坐标
-            const scaleX = displayW / this.video.videoWidth;
-            const scaleY = displayH / this.video.videoHeight;
-
-            // === 设置叠加Canvas尺寸并清空 ===
-            // 注意：直接用CSS的100%尺寸，JS不再重复设置width/height属性
-            // 避免每帧重置画布导致的闪烁和上下文状态丢失
-            this.ctx.clearRect(0, 0, containerW, containerH);
-
-            // === 绘制检测结果 ===
-            if (result.faces && result.faces.length > 0) {
-                result.faces.forEach((face, index) => {
-                    const [x1, y1, x2, y2] = face.bbox;
-
-                    // 原图坐标 → 显示坐标（缩放）
-                    let sx = x1 * scaleX;
-                    let sy = y1 * scaleY;
-                    let sw = (x2 - x1) * scaleX;
-                    let sh = (y2 - y1) * scaleY;
-
-                    // 关键修复：X轴镜像翻转
-                    // 视频CSS做了scaleX(-1)，所以检测框x也要翻转才能对齐
-                    sx = offsetX + displayW - (sx + sw);
-                    // sy 不变，Y轴无镜像
-
-                    // 绘制单个检测框（直接使用计算后的屏幕坐标，无需canvas transform）
-                    this._drawSingleBox(sx, sy, sw, sh, face.confidence, index);
-                });
-            }
-
-            // 更新统计
-            updateStats(result.count, result.inference_time, this.currentFps);
-            updateResultsList(result.faces);
+                    if (!sent) {
+                        console.warn('[Camera] 帧发送失败：WebSocket未就绪');
+                    }
+                },
+                'image/jpeg',
+                0.8  // JPEG质量，平衡画质与传输体积
+            );
         } catch (error) {
-            // 首次错误弹窗提示，后续静默避免频繁打扰
+            this.isDetecting = false;
             if (!this._hasShownError) {
                 this._hasShownError = true;
-                showToast(`检测异常: ${error.message}`, 'error', 5000);
-                // 5秒后重置标记，允许再次提示（应对服务重启等场景）
+                showToast(`帧捕获异常: ${error.message}`, 'error', 5000);
                 setTimeout(() => { this._hasShownError = false; }, 5000);
             }
-            console.warn('帧检测失败:', error.message);
-        } finally {
-            this.isDetecting = false;
+            console.warn('帧捕获失败:', error.message);
         }
+    },
+
+    /**
+     * 处理WebSocket异步返回的检测结果并绘制到叠加Canvas
+     *
+     * 由WSDetectClient.onResult回调触发，将服务端推送的检测结果
+     * 绘制到摄像头视频上方的叠加层。由于WebSocket的异步特性，
+     * 结果到达时间与发送时间不完全对应，始终绘制最新收到的结果。
+     *
+     * @param {Object} result - 服务端返回的检测结果对象
+     * @param {Array} result.faces - 人脸列表，每项包含bbox和confidence
+     * @param {number} result.count - 人脸数量
+     * @param {number} result.inference_time - 推理耗时(ms)
+     * @returns {void}
+     *
+     * @notes
+     *   - 坐标映射逻辑与原HTTP模式一致（镜像翻转 + 缩放 + 偏移）
+     *   - 统计信息在此处更新（替代原来detectFrame内的同步更新）
+     */
+    _handleWSResult(result) {
+        // 调试日志
+        console.log('[Camera] WS检测结果:', result.count, '张人脸', result.faces?.length > 0 ? result.faces : '无');
+
+        // === 计算视频在容器中的实际显示尺寸和偏移 ===
+        const container = document.getElementById('canvasContainer');
+        const containerW = container.clientWidth;
+        const containerH = container.clientHeight;
+        const videoAspect = this.video.videoWidth / this.video.videoHeight;
+        const containerAspect = containerW / containerH;
+
+        let displayW, displayH, offsetX, offsetY;
+        if (videoAspect > containerAspect) {
+            // 视频更宽：以容器宽度为准，高度留白
+            displayW = containerW;
+            displayH = containerW / videoAspect;
+            offsetX = 0;
+            offsetY = (containerH - displayH) / 2;
+        } else {
+            // 视频更高：以容器高度为准，宽度留白
+            displayH = containerH;
+            displayW = containerH * videoAspect;
+            offsetX = (containerW - displayW) / 2;
+            offsetY = 0;
+        }
+
+        // 缩放比例：原图坐标 → 显示坐标
+        const scaleX = displayW / this.video.videoWidth;
+        const scaleY = displayH / this.video.videoHeight;
+
+        // === 清空并重绘叠加层 ===
+        this.ctx.clearRect(0, 0, containerW, containerH);
+
+        // === 绘制检测结果 ===
+        if (result.faces && result.faces.length > 0) {
+            result.faces.forEach((face, index) => {
+                const [x1, y1, x2, y2] = face.bbox;
+
+                // 原图坐标 → 显示坐标（缩放）
+                let sx = x1 * scaleX;
+                let sy = y1 * scaleY;
+                let sw = (x2 - x1) * scaleX;
+                let sh = (y2 - y1) * scaleY;
+
+                // 关键修复：X轴镜像翻转
+                // 视频CSS做了scaleX(-1)，所以检测框x也要翻转才能对齐
+                sx = offsetX + displayW - (sx + sw);
+                // sy 不变，Y轴无镜像
+
+                // 绘制单个检测框
+                this._drawSingleBox(sx, sy, sw, sh, face.confidence, index);
+            });
+        }
+
+        // 更新统计
+        updateStats(result.count, result.inference_time, this.currentFps);
+        updateResultsList(result.faces);
     },
 
     /**

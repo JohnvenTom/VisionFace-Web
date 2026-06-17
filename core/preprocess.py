@@ -110,3 +110,39 @@ def validate_image(image: np.ndarray) -> bool:
     if len(image.shape) == 3 and image.shape[2] not in [1, 3, 4]:
         return False
     return True
+
+
+def decode_binary_image(binary_data: bytes) -> np.ndarray:
+    """
+    将二进制JPEG/PNG图像数据直接解码为OpenCV格式的BGR图像数组
+
+    专为WebSocket二进制帧传输设计，跳过Base64编解码步骤，
+    减少约33%的数据膨胀和CPU开销。
+
+    Args:
+        binary_data: 原始图像字节流（JPEG/PNG等格式）
+
+    Returns:
+        np.ndarray: OpenCV格式的BGR图像数组，形状为(H, W, 3)
+
+    Raises:
+        ValueError: 当输入数据为空或解码失败时抛出
+
+    Notes:
+        - 与decode_base64_image功能一致，但省去Base64中间步骤
+        - 前端通过canvas.toBlob()获取的二进制数据可直接传入
+        - 支持OpenCV能解码的所有图像格式（JPEG/PNG/BMP/WebP等）
+    """
+    if not binary_data or len(binary_data) == 0:
+        raise ValueError("二进制图像数据为空")
+
+    try:
+        nparr = np.frombuffer(binary_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    except Exception as e:
+        raise RuntimeError(f"二进制图像解码失败: {e}")
+
+    if img is None:
+        raise ValueError("二进制数据无法解码为有效图像，请检查格式是否为JPEG/PNG")
+
+    return img
