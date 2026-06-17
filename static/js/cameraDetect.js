@@ -58,6 +58,19 @@ const CameraDetector = {
     _displayCache: null,
     /** @type {HTMLElement|null} 缓存的容器DOM引用 */
     _containerEl: null,
+    /** @type {Array<Object>} Tracked face states for smooth animation (persists across frames) */
+    _trackedFaces: [],
+    /** @type {Array<string>} Color palette for multi-face detection boxes */
+    _faceColors: [
+        '#f0a030', // amber (primary)
+        '#30c0f0', // cyan
+        '#e05080', // rose
+        '#70d060', // green
+        '#b070f0', // purple
+        '#f0c030', // gold
+        '#30f0b0', // teal
+        '#f07040', // orange-red
+    ],
 
     /**
      * 初始化摄像头检测模块
@@ -79,14 +92,11 @@ const CameraDetector = {
         this.ctx = this.canvas.getContext('2d');
         this.selectEl = document.getElementById('cameraDeviceSelect');
 
-        // 监听容器尺寸变化，同步更新Canvas缓冲区尺寸并刷新显示缓存
+        // Watch container size changes, re-sync canvas overlay to video position
         const container = document.getElementById('canvasContainer');
         this._resizeObserver = new ResizeObserver(() => {
             if (container.clientWidth > 0 && container.clientHeight > 0) {
-                this.canvas.width = container.clientWidth;
-                this.canvas.height = container.clientHeight;
-                // 标记显示缓存失效（下次检测帧时重新计算）
-                this._displayCache = null;
+                this._syncOverlayToVideo();
             }
         });
         this._resizeObserver.observe(container);
@@ -348,22 +358,17 @@ const CameraDetector = {
         this.frameCount = 0;
         this.fpsIntervalStart = performance.now();
         this._hasShownError = false;
+        this._trackedFaces = [];
+        this._lastRenderTime = null;
 
-        // 缓存容器DOM引用
+        // Cache container DOM reference
         this._containerEl = document.getElementById('canvasContainer');
 
-        // 同步Canvas缓冲区尺寸与容器一致
-        this.canvas.width = this._containerEl.clientWidth;
-        this.canvas.height = this._containerEl.clientHeight;
-
-        // 创建复用的临时截图Canvas（避免每帧 createElement + getContext）
+        // Create reusable temp canvas for screenshot capture
         this._tempCanvas = document.createElement('canvas');
         this._tempCtx = this._tempCanvas.getContext('2d');
 
-        // 初始化显示尺寸缓存
-        this._updateDisplayCache();
-
-        // 更新UI状态
+        // Update UI state: show video + canvas FIRST (so browser can lay them out)
         this.video.classList.remove('hidden');
         this.canvas.classList.remove('hidden');
         document.getElementById('emptyState').classList.add('hidden');
@@ -372,10 +377,16 @@ const CameraDetector = {
         document.getElementById('btnStopCamera').disabled = false;
         document.getElementById('btnPauseDetect').disabled = false;
 
-        // 锁定下拉框，防止运行中切换设备
+        // Lock select dropdown while running
         this.selectEl.disabled = true;
 
-        this.detectLoop();
+        // Sync canvas overlay AFTER video is visible (double-RAF ensures layout is settled)
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                this._syncOverlayToVideo();
+                this.detectLoop();
+            });
+        });
     },
 
     /**
@@ -413,11 +424,13 @@ const CameraDetector = {
         // 清空画布
         this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 
-        // 重置状态
+        // Reset state
         this.isRunning = false;
         this.isPaused = false;
         this.isDetecting = false;
         this._hasShownError = false;
+        this._trackedFaces = [];
+        this._lastRenderTime = null;
 
         // 更新UI
         this.video.classList.add('hidden');
@@ -433,7 +446,7 @@ const CameraDetector = {
         this.selectEl.disabled = false;
         this.enumerateDevices();
 
-        showToast('摄像头已关闭', 'info');
+        showToast('Camera stopped', 'info');
     },
 
     /**
@@ -453,19 +466,19 @@ const CameraDetector = {
 
         if (this.isPaused) {
             btn.innerHTML = `
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <polygon points="5 3 19 12 5 21 5 3"/>
                 </svg>
-                恢复检测`;
-            showToast('检测已暂停', 'warning');
+                Play`;
+            showToast('Detection paused', 'warning');
         } else {
             btn.innerHTML = `
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
                     <rect x="6" y="4" width="4" height="16"/>
                     <rect x="14" y="4" width="4" height="16"/>
                 </svg>
-                暂停检测`;
-            showToast('检测已恢复', 'info');
+                Pause`;
+            showToast('Detection resumed', 'info');
         }
     },
 
@@ -489,7 +502,7 @@ const CameraDetector = {
 
         this.animFrameId = requestAnimationFrame(() => this.detectLoop());
 
-        // 帧率统计
+        // FPS calculation
         this.frameCount++;
         const now = performance.now();
         if (now - this.fpsIntervalStart >= this.fpsInterval) {
@@ -500,7 +513,10 @@ const CameraDetector = {
             this.fpsIntervalStart = now;
         }
 
-        // 检测控制：暂停或上一帧未完成时跳过
+        // === Render tracked faces every frame for smooth animation ===
+        this._renderTrackedFaces(now);
+
+        // === Send detection request at controlled interval ===
         if (this.isPaused || this.isDetecting) return;
         if (now - this.lastDetectTime < this.detectInterval) return;
 
@@ -510,44 +526,107 @@ const CameraDetector = {
     },
 
     /**
-     * 更新容器显示尺寸缓存
+     * Render all tracked faces with animated opacity, called every animation frame
      *
-     * 预计算视频在容器中的显示尺寸、偏移量和缩放比例，
-     * 缓存结果供 detectFrame 每帧直接读取，避免重复 DOM 查询和浮点运算。
+     * Each tracked face has an opacity value that smoothly animates:
+     *   - New faces: fade in from 0 to 1 over ~250ms
+     *   - Lost faces: fade out from 1 to 0 over ~300ms, then removed
+     *   - Active faces: stay at full opacity
      *
+     * @param {number} now - Current timestamp from performance.now()
      * @returns {void}
-     *
-     * @notes
-     *   - 在 _postStartInit 初始化时调用一次
-     *   - ResizeObserver 标记缓存失效后，下次 detectFrame 时重新计算
      */
-    _updateDisplayCache() {
-        const cw = this._containerEl.clientWidth;
-        const ch = this._containerEl.clientHeight;
-        const vw = this.video.videoWidth || 640;
-        const vh = this.video.videoHeight || 480;
-        const videoAspect = vw / vh;
-        const containerAspect = cw / ch;
+    _renderTrackedFaces(now) {
+        if (!this._displayCache || !this.ctx) return;
+        const dc = this._displayCache;
 
-        let displayW, displayH, offsetX, offsetY;
-        if (videoAspect > containerAspect) {
-            displayW = cw;
-            displayH = cw / videoAspect;
-            offsetX = 0;
-            offsetY = (ch - displayH) / 2;
-        } else {
-            displayH = ch;
-            displayW = ch * videoAspect;
-            offsetX = (cw - displayW) / 2;
-            offsetY = 0;
+        // Clear overlay
+        this.ctx.clearRect(0, 0, dc.displayW, dc.displayH);
+
+        if (this._trackedFaces.length === 0) return;
+
+        const FADE_IN_MS = 250;
+        const FADE_OUT_MS = 300;
+        const dt = now - (this._lastRenderTime || now);
+        this._lastRenderTime = now;
+
+        // Animate and draw each tracked face
+        const stillAlive = [];
+        for (let i = 0; i < this._trackedFaces.length; i++) {
+            const face = this._trackedFaces[i];
+
+            if (face.state === 'entering') {
+                face.opacity = Math.min(1, face.opacity + dt / FADE_IN_MS);
+                if (face.opacity >= 1) { face.opacity = 1; face.state = 'active'; }
+            } else if (face.state === 'leaving') {
+                face.opacity = Math.max(0, face.opacity - dt / FADE_OUT_MS);
+                if (face.opacity <= 0) continue; // Remove fully faded
+            }
+
+            stillAlive.push(face);
+
+            this._drawSingleBox(
+                face.sx, face.sy, face.sw, face.sh,
+                face.confidence, face.index,
+                face.color, face.opacity
+            );
         }
 
+        this._trackedFaces = stillAlive;
+    },
+
+    /**
+     * Sync canvas overlay position & dimensions to exactly match the video element's rendered area
+     *
+     * Uses getBoundingClientRect() to measure where the browser actually renders the video
+     * within its container (accounting for object-fit: contain, borders, padding, etc.).
+     * Then positions the overlay canvas directly on top of the video with identical pixel dimensions.
+     *
+     * This eliminates all offset/scale calculation mismatches between CSS layout and JS math.
+     *
+     * @returns {void}
+     */
+    _syncOverlayToVideo() {
+        if (!this.video || !this.canvas || !this._containerEl) return;
+
+        const containerRect = this._containerEl.getBoundingClientRect();
+        const videoRect = this.video.getBoundingClientRect();
+
+        // Guard: skip if video has zero dimensions (hidden/not laid out yet)
+        if (videoRect.width < 1 || videoRect.height < 1) {
+            this._displayCache = null;
+            return;
+        }
+
+        // Video position relative to container
+        const left = videoRect.left - containerRect.left;
+        const top = videoRect.top - containerRect.top;
+        const width = videoRect.width;
+        const height = videoRect.height;
+
+        // Position canvas exactly over the video element
+        this.canvas.style.position = 'absolute';
+        this.canvas.style.left = `${left}px`;
+        this.canvas.style.top = `${top}px`;
+        this.canvas.style.width = `${width}px`;
+        this.canvas.style.height = `${height}px`;
+        this.canvas.style.inset = 'auto'; // Override CSS inset:0
+
+        // Set canvas buffer to match rendered pixels (1:1 with display)
+        const dpr = window.devicePixelRatio || 1;
+        this.canvas.width = Math.round(width * dpr);
+        this.canvas.height = Math.round(height * dpr);
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // Scale for HiDPI
+
+        // Cache scale factors for coordinate conversion (video intrinsic → display)
+        const vw = this.video.videoWidth || 640;
+        const vh = this.video.videoHeight || 480;
+
         this._displayCache = {
-            containerW: cw,
-            containerH: ch,
-            displayW, displayH, offsetX, offsetY,
-            scaleX: displayW / vw,
-            scaleY: displayH / vh
+            displayW: width,
+            displayH: height,
+            scaleX: width / vw,
+            scaleY: height / vh
         };
     },
 
@@ -569,124 +648,239 @@ const CameraDetector = {
         if (!this.video.videoWidth || !this.video.videoHeight) return;
 
         try {
-            // === 1. 复用临时Canvas截图（不再每帧新建） ===
+            // === 1. Reuse temp canvas for screenshot capture ===
             const tc = this._tempCanvas;
             tc.width = this.video.videoWidth;
             tc.height = this.video.videoHeight;
             this._tempCtx.drawImage(this.video, 0, 0);
 
-            // === 2. JPEG编码（质量0.7：速度优先） ===
+            // === 2. JPEG encode (quality 0.7: speed priority) ===
             const blob = await new Promise((resolve) => {
                 tc.toBlob(resolve, 'image/jpeg', 0.7);
             });
             if (!blob) return;
 
-            // === 3. 通过WebSocket发送并 await 等待对应结果 ===
+            // === 3. Send via WebSocket and await corresponding result ===
             const result = await WSDetectClient.sendFrame(blob);
 
-            // === 4. 获取/刷新显示尺寸缓存 ===
+            // === 4. Refresh display cache if stale ===
             if (!this._displayCache) {
-                this._updateDisplayCache();
+                this._syncOverlayToVideo();
             }
             const dc = this._displayCache;
 
-            // === 5. 清空叠加层并绘制检测结果 ===
-            this.ctx.clearRect(0, 0, dc.containerW, dc.containerH);
+            // === 5. Match new detections to tracked faces (smooth animation) ===
+            this._matchDetectionsToTracked(result.faces || [], dc);
 
-            if (result.faces && result.faces.length > 0) {
-                for (let i = 0; i < result.faces.length; i++) {
-                    const face = result.faces[i];
-                    const [x1, y1, x2, y2] = face.bbox;
-
-                    let sx = x1 * dc.scaleX;
-                    let sy = y1 * dc.scaleY;
-                    let sw = (x2 - x1) * dc.scaleX;
-                    let sh = (y2 - y1) * dc.scaleY;
-
-                    // X轴镜像翻转（视频CSS做了scaleX(-1)）
-                    sx = dc.offsetX + dc.displayW - (sx + sw);
-
-                    this._drawSingleBox(sx, sy, sw, sh, face.confidence, i);
-                }
-            }
-
-            // 更新统计信息
+            // Update statistics
             updateStats(result.count, result.inference_time, this.currentFps);
             updateResultsList(result.faces);
         } catch (error) {
             if (!this._hasShownError) {
                 this._hasShownError = true;
-                showToast(`检测异常: ${error.message}`, 'error', 5000);
+                showToast(`Detection error: ${error.message}`, 'error', 5000);
                 setTimeout(() => { this._hasShownError = false; }, 5000);
             }
         }
     },
 
     /**
-     * 在叠加Canvas上绘制单个人脸检测框（摄像头模式专用）
+     * Match new detection results to existing tracked faces for smooth transitions
      *
-     * 直接使用已转换好的屏幕坐标绘制，不依赖Canvas transform，
-     * 避免复杂变换矩阵带来的坐标偏移问题。
+     * Uses IoU-based matching to associate new detections with previously tracked faces:
+     *   - Matched faces: update position/confidence, stay active
+     *   - Unmatched new faces: enter with fade-in animation
+     *   - Orphaned old faces: begin fade-out animation
      *
-     * @param {number} x - 检测框左上角X坐标（已做镜像+缩放+偏移）
-     * @param {number} y - 检测框左上角Y坐标（已做缩放+偏移）
-     * @param {number} w - 检测框宽度
-     * @param {number} h - 检测框高度
-     * @param {number} confidence - 置信度 (0-1)
-     * @param {number} index - 人脸序号
+     * @param {Array<Object>} newFaces - Fresh detection results from backend
+     * @param {Object} dc - Display cache with scale factors
      * @returns {void}
      */
-    _drawSingleBox(x, y, w, h, confidence, index) {
-        const ctx = this.ctx;
+    _matchDetectionsToTracked(newFaces, dc) {
+        const MATCH_IOU_THRESHOLD = 0.2; // Minimum IoU to consider a match
 
-        // 发光效果
-        ctx.shadowColor = '#00f0ff';
+        // Convert new detections to display coordinates
+        const newDisplayFaces = [];
+        for (let i = 0; i < newFaces.length; i++) {
+            const f = newFaces[i];
+            const [x1, y1, x2, y2] = f.bbox;
+            let sx = x1 * dc.scaleX;
+            let sy = y1 * dc.scaleY;
+            let sw = (x2 - x1) * dc.scaleX;
+            let sh = (y2 - y1) * dc.scaleY;
+            // X-axis mirror flip
+            sx = dc.displayW - (sx + sw);
+
+            newDisplayFaces.push({
+                sx, sy, sw, sh,
+                confidence: f.confidence,
+                rawIndex: i,
+                color: this._faceColors[i % this._faceColors.length]
+            });
+        }
+
+        // Greedy IoU matching: new detections → existing tracked faces
+        const usedNew = new Set();
+        const usedOld = new Set();
+
+        for (let ti = 0; ti < this._trackedFaces.length; ti++) {
+            if (usedOld.has(ti)) continue;
+            const tracked = this._trackedFaces[ti];
+            if (tracked.state === 'leaving') continue;
+
+            let bestNi = -1;
+            let bestIou = 0;
+
+            for (let ni = 0; ni < newDisplayFaces.length; ni++) {
+                if (usedNew.has(ni)) continue;
+                const iou = this._calcIoU(tracked, newDisplayFaces[ni]);
+                if (iou > bestIou) { bestIou = iou; bestNi = ni; }
+            }
+
+            if (bestNi >= 0 && bestIou >= MATCH_IOU_THRESHOLD) {
+                // Match found: update tracked face position smoothly
+                const nf = newDisplayFaces[bestNi];
+                tracked.sx = nf.sx; tracked.sy = nf.sy;
+                tracked.sw = nf.sw; tracked.sh = nf.sh;
+                tracked.confidence = nf.confidence;
+                tracked.index = nf.rawIndex;
+                tracked.color = nf.color;
+                tracked.state = 'active';
+                tracked.opacity = 1;
+                usedNew.add(bestNi);
+                usedOld.add(ti);
+            }
+        }
+
+        // Unmatched old tracked faces → start fading out
+        for (let ti = 0; ti < this._trackedFaces.length; ti++) {
+            if (!usedOld.has(ti) && this._trackedFaces[ti].state !== 'leaving') {
+                this._trackedFaces[ti].state = 'leaving';
+            }
+        }
+
+        // Unmatched new detections → add as entering (fade in)
+        for (let ni = 0; ni < newDisplayFaces.length; ni++) {
+            if (!usedNew.has(ni)) {
+                const nf = newDisplayFaces[ni];
+                this._trackedFaces.push({
+                    sx: nf.sx, sy: nf.sy, sw: nf.sw, sh: nf.sh,
+                    confidence: nf.confidence,
+                    index: nf.rawIndex,
+                    color: nf.color,
+                    opacity: 0,
+                    state: 'entering'
+                });
+            }
+        }
+    },
+
+    /**
+     * Calculate Intersection over Union (IoU) between two face bounding boxes
+     *
+     * Used for matching detected faces across frames to maintain identity.
+     *
+     * @param {Object} a - First box with sx, sy, sw, sh properties
+     * @param {Object} b - Second box with sx, sy, sw, sh properties
+     * @returns {number} IoU value between 0 (no overlap) and 1 (identical)
+     */
+    _calcIoU(a, b) {
+        const ax1 = a.sx, ay1 = a.sy, ax2 = a.sx + a.sw, ay2 = a.sy + a.sh;
+        const bx1 = b.sx, by1 = b.sy, bx2 = b.sx + b.sw, by2 = b.sy + b.sh;
+
+        const ix1 = Math.max(ax1, bx1), iy1 = Math.max(ay1, by1);
+        const ix2 = Math.min(ax2, bx2), iy2 = Math.min(ay2, by2);
+
+        const interW = Math.max(0, ix2 - ix1);
+        const interH = Math.max(0, iy2 - iy1);
+        const interArea = interW * interH;
+
+        const areaA = a.sw * a.sh;
+        const areaB = b.sw * b.sh;
+        const unionArea = areaA + areaB - interArea;
+
+        return unionArea > 0 ? interArea / unionArea : 0;
+    },
+
+    /**
+     * Draw a single face detection box on the overlay canvas (camera mode)
+     *
+     * Uses pre-converted screen coordinates, supports per-face colors and
+     * opacity animation for smooth appear/disappear transitions.
+     *
+     * @param {number} x - Box left X (mirrored + scaled)
+     * @param {number} y - Box top Y (scaled)
+     * @param {number} w - Box width
+     * @param {number} h - Box height
+     * @param {number} confidence - Confidence score (0-1)
+     * @param {number} index - Face sequence number
+     * @param {string} [color='#f0a030'] - Box color from palette
+     * @param {number} [opacity=1] - Opacity for fade animation (0-1)
+     * @returns {void}
+     */
+    _drawSingleBox(x, y, w, h, confidence, index, color, opacity) {
+        const ctx = this.ctx;
+        const c = color || '#f0a030';
+        const alpha = opacity !== undefined ? opacity : 1;
+
+        ctx.globalAlpha = alpha;
+
+        // Glow effect
+        ctx.shadowColor = c;
         ctx.shadowBlur = 10;
 
-        // 检测框边框
-        ctx.strokeStyle = '#00f0ff';
+        // Detection box border
+        ctx.strokeStyle = c;
         ctx.lineWidth = 2;
         ctx.strokeRect(x, y, w, h);
 
-        // 角标装饰
+        // Corner decorations
         const cornerLen = Math.min(15, w * 0.2, h * 0.2);
         ctx.lineWidth = 3;
         ctx.beginPath();
-        // 左上角
-        ctx.moveTo(x, y + cornerLen);
-        ctx.lineTo(x, y);
-        ctx.lineTo(x + cornerLen, y);
-        // 右上角
-        ctx.moveTo(x + w - cornerLen, y);
-        ctx.lineTo(x + w, y);
-        ctx.lineTo(x + w, y + cornerLen);
-        // 右下角
-        ctx.moveTo(x + w, y + h - cornerLen);
-        ctx.lineTo(x + w, y + h);
-        ctx.lineTo(x + w - cornerLen, y + h);
-        // 左下角
-        ctx.moveTo(x + cornerLen, y + h);
-        ctx.lineTo(x, y + h);
-        ctx.lineTo(x, y + h - cornerLen);
+        // Top-left
+        ctx.moveTo(x, y + cornerLen); ctx.lineTo(x, y); ctx.lineTo(x + cornerLen, y);
+        // Top-right
+        ctx.moveTo(x + w - cornerLen, y); ctx.lineTo(x + w, y); ctx.lineTo(x + w, y + cornerLen);
+        // Bottom-right
+        ctx.moveTo(x + w, y + h - cornerLen); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w - cornerLen, y + h);
+        // Bottom-left
+        ctx.moveTo(x + cornerLen, y + h); ctx.lineTo(x, y + h); ctx.lineTo(x, y + h - cornerLen);
         ctx.stroke();
 
-        // 重置阴影
+        // Reset shadow
         ctx.shadowBlur = 0;
 
-        // 置信度标签
+        // Confidence label
         const label = `Face ${index + 1}: ${(confidence * 100).toFixed(1)}%`;
-        ctx.font = '600 12px "IBM Plex Sans", sans-serif';
+        ctx.font = '600 12px "Space Grotesk", "DM Sans", sans-serif';
         const textMetrics = ctx.measureText(label);
         const textW = textMetrics.width + 12;
         const textH = 20;
 
-        // 标签背景
-        ctx.fillStyle = 'rgba(0, 240, 255, 0.85)';
+        // Label background with matching color
+        ctx.fillStyle = this._hexToRgba(c, 0.85 * alpha);
         ctx.fillRect(x, y - textH - 2, textW, textH);
 
-        // 标签文字
-        ctx.fillStyle = '#060a13';
+        // Label text
+        ctx.fillStyle = this._hexToRgba('#0d1117', alpha);
         ctx.fillText(label, x + 6, y - 7);
+
+        ctx.globalAlpha = 1; // Restore
+    },
+
+    /**
+     * Convert hex color string to rgba() format with given alpha
+     *
+     * @param {string} hex - Hex color like '#f0a030'
+     * @param {number} alpha - Alpha value between 0 and 1
+     * @returns {string} CSS rgba() color string
+     */
+    _hexToRgba(hex, alpha) {
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        return `rgba(${r},${g},${b},${alpha})`;
     },
 
     /**
