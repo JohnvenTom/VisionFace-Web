@@ -858,13 +858,35 @@ const CameraDetector = {
         const textW = textMetrics.width + 12;
         const textH = 20;
 
+        // Auto-position: above box by default, below if too close to top edge
+        const dc = this._displayCache;
+        const labelAbove = y > textH + 4; // leave small margin
+        let labelX = x;
+        let labelY, textBaselineY;
+
+        if (labelAbove) {
+            // Draw above the box
+            labelY = y - textH - 2;
+            textBaselineY = y - 7;
+        } else {
+            // Draw below the box
+            labelY = y + h + 2;
+            textBaselineY = y + h + textH - 6;
+        }
+
+        // Clamp horizontally to stay within canvas bounds
+        if (labelX + textW > dc.displayW) {
+            labelX = dc.displayW - textW - 2;
+        }
+        if (labelX < 0) { labelX = 2; }
+
         // Label background with matching color
         ctx.fillStyle = this._hexToRgba(c, 0.85 * alpha);
-        ctx.fillRect(x, y - textH - 2, textW, textH);
+        ctx.fillRect(labelX, labelY, textW, textH);
 
         // Label text
         ctx.fillStyle = this._hexToRgba('#0d1117', alpha);
-        ctx.fillText(label, x + 6, y - 7);
+        ctx.fillText(label, labelX + 6, textBaselineY);
 
         ctx.globalAlpha = 1; // Restore
     },
