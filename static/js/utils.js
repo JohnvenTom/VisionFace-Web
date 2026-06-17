@@ -204,46 +204,74 @@ function updateStats(faceCount, inferenceTime, fps = null) {
 
 /** @type {string|null} 上一次渲染的检测结果摘要，用于防闪烁 */
 let _lastResultsHash = null;
+/** @type {Array<HTMLElement>|null} 缓存的结果卡片DOM元素数组 */
+let _resultCards = null;
 
 /**
- * 更新检测结果详情列表
-
- * @param {Array<Object>} faces - 人脸信息列表
+ * 更新检测结果详情列表（就地更新模式，避免DOM重建闪烁）
+ *
+ * 首次调用时创建卡片DOM结构，后续调用仅更新文本内容，
+ * 保持卡片DOM稳定，仅刷新数值，消除视觉闪烁。
+ *
+ * @param {Array<Object>} faces - 人脸信息列表，每项包含bbox([x1,y1,x2,y2])和confidence
  * @returns {void}
  *
  * @notes
  *   - 每个人脸显示编号、置信度和边界框坐标
  *   - 列表为空时显示"暂无检测结果"占位文字
- *   - 内置防抖机制：仅当数据实际变化时才更新DOM，避免高频重绘导致闪烁
+ *   - 使用就地更新策略：首次innerHTML创建，后续textContent更新
+ *   - 人脸数量变化时才重建DOM，否则只更新数值
  */
 function updateResultsList(faces) {
     const listEl = document.getElementById('resultsList');
 
+    // 空结果处理
     if (!faces || faces.length === 0) {
-        const emptyHtml = '<div class="results-empty">暂无检测结果</div>';
-        // 仅在内容变化时更新
         if (_lastResultsHash !== '__empty__') {
-            listEl.innerHTML = emptyHtml;
+            listEl.innerHTML = '<div class="results-empty">暂无检测结果</div>';
             _lastResultsHash = '__empty__';
+            _resultCards = null;
         }
         return;
     }
 
-    // 生成当前数据的轻量哈希（人脸数 + 各置信度取整），避免不必要的DOM重建
-    const hash = faces.length + '|' + faces.map(f => Math.round(f.confidence * 100)).join(',');
+    // 人脸数量变化 → 需要重建DOM
+    const faceCount = faces.length;
+    if (!_resultCards || _resultCards.length !== faceCount) {
+        // 构建新的卡片HTML
+        listEl.innerHTML = faces.map((_, i) => `
+            <div class="result-item">
+                <span class="face-id">FACE-${String(i + 1).padStart(2, '0')}</span>
+                <span class="face-conf"></span>
+                <span class="face-bbox"></span>
+            </div>
+        `).join('');
 
-    if (hash === _lastResultsHash) {
-        return; // 数据未变，跳过渲染
+        // 缓存卡片元素引用
+        _resultCards = Array.from(listEl.children);
+        _lastResultsHash = null;  // 强制首次数值填充
     }
-    _lastResultsHash = hash;
 
-    listEl.innerHTML = faces.map((face, i) => `
-        <div class="result-item">
-            <span class="face-id">FACE-${String(i + 1).padStart(2, '0')}</span>
-            <span class="face-conf">${(face.confidence * 100).toFixed(1)}%</span>
-            <span class="face-bbox">[${face.bbox.map(v => Math.round(v)).join(', ')}]</span>
-        </div>
-    `).join('');
+    // === 就地更新每个卡片的数值（不重建DOM） ===
+    let hash = faceCount + '|';
+    for (let i = 0; i < faceCount; i++) {
+        const face = faces[i];
+        const confStr = (face.confidence * 100).toFixed(1) + '%';
+        const bboxStr = '[' + face.bbox.map(v => Math.round(v)).join(', ') + ']';
+
+        // 更新文本内容（不触发DOM重建）
+        const card = _resultCards[i];
+        card.querySelector('.face-conf').textContent = confStr;
+        card.querySelector('.face-bbox').textContent = bboxStr;
+
+        // 累加哈希用于检测是否有实际变化
+        hash += Math.round(face.confidence * 100) + ',';
+    }
+
+    // 记录哈希用于下次对比
+    if (hash !== _lastResultsHash) {
+        _lastResultsHash = hash;
+    }
 }
 
 
