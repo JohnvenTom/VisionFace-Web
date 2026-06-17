@@ -251,6 +251,22 @@ async def websocket_detect(websocket: WebSocket):
     conf_threshold = 0.5
     iou_threshold = 0.45
 
+    async def safe_send(data):
+        """
+        安全发送WebSocket消息，客户端断连时静默处理
+
+        Args:
+            data: 待发送的数据（dict会被转为JSON文本帧）
+
+        Returns:
+            bool: 发送成功返回True，客户端已断连返回False
+        """
+        try:
+            await websocket.send_json(data)
+            return True
+        except (WebSocketDisconnect, Exception):
+            return False
+
     try:
         while True:
             # 接收消息（可能是二进制帧数据或文本配置消息）
@@ -263,14 +279,13 @@ async def websocket_detect(websocket: WebSocket):
                     if config.get("type") == "config":
                         conf_threshold = config.get("conf_threshold", conf_threshold)
                         iou_threshold = config.get("iou_threshold", iou_threshold)
-                        await websocket.send_json({
+                        await safe_send({
                             "type": "config_ack",
                             "conf_threshold": conf_threshold,
                             "iou_threshold": iou_threshold
                         })
                 except (json.JSONDecodeError, TypeError):
-                    error_msg = {"type": "error", "detail": "无效的配置消息格式"}
-                    await websocket.send_json(error_msg)
+                    await safe_send({"type": "error", "detail": "Invalid config message format"})
                 continue
 
             # 处理二进制帧数据
@@ -282,10 +297,10 @@ async def websocket_detect(websocket: WebSocket):
                 # 直接解码二进制图像（无需Base64解码）
                 image = decode_binary_image(binary_data)
             except ValueError as e:
-                await websocket.send_json({"type": "error", "detail": f"帧数据无效: {e}"})
+                await safe_send({"type": "error", "detail": f"Invalid frame data: {e}"})
                 continue
             except Exception as e:
-                await websocket.send_json({"type": "error", "detail": f"帧解码失败: {e}"})
+                await safe_send({"type": "error", "detail": f"Frame decode failed: {e}"})
                 continue
 
             try:
@@ -296,16 +311,26 @@ async def websocket_detect(websocket: WebSocket):
                     iou_threshold=iou_threshold
                 )
                 # 推送检测结果（JSON文本帧）
-                await websocket.send_json(parse_results(result))
+                await safe_send(parse_results(result))
             except Exception as e:
                 traceback.print_exc()
-                await websocket.send_json({"type": "error", "detail": f"推理失败: {e}"})
+                await safe_send({"type": "error", "detail": f"Inference failed: {e}"})
 
     except WebSocketDisconnect:
-        print("[WS] 客户端断开连接")
+        print("[WS] Client disconnected")
+    except RuntimeError as e:
+        # 客户端断连后 receive() 会抛出此异常，属于正常情况
+        msg_lower = str(e).lower()
+        if "disconnect" in msg_lower or "receive" in msg_lower or "send" in msg_lower:
+            print("[WS] Connection closed by client")
+        else:
+            print(f"[WS] Runtime error: {e}")
     except Exception as e:
-        print(f"[WS] 连接异常: {e}")
-        await websocket.close(code=1011, reason=f"服务端内部错误: {e}")
+        print(f"[WS] Unexpected error: {e}")
+        try:
+            await websocket.close(code=1011, reason=f"Server internal error: {e}")
+        except Exception:
+            pass
 
 
 # ============================================================

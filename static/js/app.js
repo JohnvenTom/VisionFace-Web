@@ -39,8 +39,9 @@ const App = {
         this.bindParamSliders();
         this.bindResetButton();
 
-        // 检查服务状态
+        // 检查服务状态（立即执行一次，之后每30秒轮询）
         this.checkServerStatus();
+        setInterval(() => this.checkServerStatus(), 30000);
     },
 
     /**
@@ -206,9 +207,6 @@ const App = {
             modelDot.className = 'status-dot offline';
             deviceLabel.textContent = '服务离线';
         }
-
-        // 定时刷新状态
-        setInterval(() => this.checkServerStatus(), 30000);
     }
 };
 
