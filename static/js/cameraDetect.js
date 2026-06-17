@@ -268,9 +268,8 @@ const CameraDetector = {
             this.video.srcObject = this.stream;
             await this.video.play();
 
-            // 建立WebSocket连接（替代HTTP轮询）
+            // 建立WebSocket持久连接（替代HTTP轮询）
             await WSDetectClient.connect({
-                onResult: (result) => this._handleWSResult(result),
                 onError: (errMsg) => {
                     if (!this._hasShownError) {
                         this._hasShownError = true;
@@ -287,7 +286,7 @@ const CameraDetector = {
 
             this.isRunning = true;
             this._postStartInit();
-            showToast('摄像头已开启 (WebSocket模式)', 'success');
+            showToast('摄像头已开启', 'success');
         } catch (error) {
             if (error.name === 'NotAllowedError') {
                 showToast('摄像头权限被拒绝，请在浏览器设置中允许', 'error');
@@ -295,7 +294,6 @@ const CameraDetector = {
                 showToast('未检测到所选摄像头设备，请检查连接', 'error');
             } else if (error.name === 'OverconstrainedError') {
                 showToast('所选摄像头不支持请求的分辨率，将尝试默认设置', 'warning');
-                // 回退：去掉精确约束重试一次
                 try {
                     this.stream = await navigator.mediaDevices.getUserMedia({
                         video: { width: { ideal: 640 }, height: { ideal: 480 } },
@@ -304,9 +302,7 @@ const CameraDetector = {
                     this.video.srcObject = this.stream;
                     await this.video.play();
 
-                    // 建立WebSocket连接（回退路径也需要）
                     await WSDetectClient.connect({
-                        onResult: (result) => this._handleWSResult(result),
                         onError: (errMsg) => {
                             if (!this._hasShownError) {
                                 this._hasShownError = true;
@@ -458,6 +454,8 @@ const CameraDetector = {
      * 实时检测主循环
      *
      * 通过requestAnimationFrame驱动，逐帧捕获视频画面并发送检测请求。
+     * 使用请求-应答配对模式：发送一帧后等待结果返回再发送下一帧，
+     * 确保检测结果与视频帧严格一一对应。
      *
      * @returns {void}
      *
@@ -465,6 +463,7 @@ const CameraDetector = {
      *   - 检测频率受detectInterval控制，避免过度请求
      *   - 帧率统计每秒更新一次
      *   - 暂停状态下仅更新画面不发送请求
+     *   - isDetecting 标志防止前一帧未完成时重复发送（串行化）
      */
     detectLoop() {
         if (!this.isRunning) return;
@@ -482,145 +481,107 @@ const CameraDetector = {
             this.fpsIntervalStart = now;
         }
 
-        // 检测控制
+        // 检测控制：暂停或上一帧未完成时跳过
         if (this.isPaused || this.isDetecting) return;
         if (now - this.lastDetectTime < this.detectInterval) return;
 
         this.lastDetectTime = now;
-        this.detectFrame();
+        this.isDetecting = true;
+        this.detectFrame().finally(() => { this.isDetecting = false; });
     },
 
     /**
-     * 捕获当前视频帧并通过WebSocket二进制发送
+     * 捕获当前视频帧并通过WebSocket发送，等待检测结果后绘制
      *
      * 使用canvas.toBlob()获取压缩后的JPEG二进制数据，
-     * 直接通过WebSocket发送，无需Base64编码。
-     * 检测结果通过异步回调(_handleWSResult)接收并绘制。
+     * 通过WebSocket发送后 **await 等待对应结果返回**（请求-应答配对），
+     * 收到结果后立即在同一函数内绘制检测框，保证帧-结果一一对应。
      *
-     * @returns {void}
+     * @returns {Promise<void>}
      *
      * @notes
      *   - 使用临时Canvas进行帧捕获，避免影响显示Canvas
-     *   - toBlob是异步操作，内部回调中调用WSDetectClient.sendFrame()
-     *   - 发送失败时静默处理，不中断检测循环
-     *   - 参数(conf/iou)通过WebSocket配置消息动态更新，不再每帧读取
+     *   - toBlob 通过 Promise 封装变为可 await 的操作
+     *   - sendFrame 返回 Promise，await 后拿到对应的检测结果
+     *   - 绘制逻辑与原HTTP模式完全一致：清空→计算坐标→绘制框→更新统计
+     *   - 参数(conf/iou)通过WebSocket配置消息动态更新
      */
-    detectFrame() {
+    async detectFrame() {
         if (!this.video.videoWidth || !this.video.videoHeight) return;
 
-        this.isDetecting = true;
-
         try {
-            // 捕获视频帧到临时Canvas（捕获的是原始像素，非CSS变换后的）
+            // === 1. 捕获视频帧到临时Canvas ===
             const tempCanvas = document.createElement('canvas');
             tempCanvas.width = this.video.videoWidth;
             tempCanvas.height = this.video.videoHeight;
             const tempCtx = tempCanvas.getContext('2d');
             tempCtx.drawImage(this.video, 0, 0);
 
-            // 转为Blob（二进制），替代Base64编码 —— 消除~33%数据膨胀
-            tempCanvas.toBlob(
-                (blob) => {
-                    if (!blob) {
-                        this.isDetecting = false;
-                        return;
-                    }
-                    // 通过WebSocket发送二进制帧（fire-and-forget）
-                    const sent = WSDetectClient.sendFrame(blob);
-                    this.isDetecting = false;
+            // === 2. 转为Blob（二进制）—— Promise封装使toBlob可await ===
+            const blob = await new Promise((resolve) => {
+                tempCanvas.toBlob(resolve, 'image/jpeg', 0.8);
+            });
+            if (!blob) return;
 
-                    if (!sent) {
-                        console.warn('[Camera] 帧发送失败：WebSocket未就绪');
-                    }
-                },
-                'image/jpeg',
-                0.8  // JPEG质量，平衡画质与传输体积
-            );
+            // === 3. 通过WebSocket发送并 await 等待对应结果 ===
+            const result = await WSDetectClient.sendFrame(blob);
+
+            // === 4. 绘制检测结果（与原HTTP模式逻辑一致） ===
+            console.log('[Camera] 检测结果:', result.count, '张人脸');
+
+            const container = document.getElementById('canvasContainer');
+            const containerW = container.clientWidth;
+            const containerH = container.clientHeight;
+            const videoAspect = this.video.videoWidth / this.video.videoHeight;
+            const containerAspect = containerW / containerH;
+
+            let displayW, displayH, offsetX, offsetY;
+            if (videoAspect > containerAspect) {
+                displayW = containerW;
+                displayH = containerW / videoAspect;
+                offsetX = 0;
+                offsetY = (containerH - displayH) / 2;
+            } else {
+                displayH = containerH;
+                displayW = containerH * videoAspect;
+                offsetX = (containerW - displayW) / 2;
+                offsetY = 0;
+            }
+
+            const scaleX = displayW / this.video.videoWidth;
+            const scaleY = displayH / this.video.videoHeight;
+
+            // 清空叠加层
+            this.ctx.clearRect(0, 0, containerW, containerH);
+
+            // 绘制检测框
+            if (result.faces && result.faces.length > 0) {
+                result.faces.forEach((face, index) => {
+                    const [x1, y1, x2, y2] = face.bbox;
+
+                    let sx = x1 * scaleX;
+                    let sy = y1 * scaleY;
+                    let sw = (x2 - x1) * scaleX;
+                    let sh = (y2 - y1) * scaleY;
+
+                    // X轴镜像翻转（视频CSS做了scaleX(-1)）
+                    sx = offsetX + displayW - (sx + sw);
+
+                    this._drawSingleBox(sx, sy, sw, sh, face.confidence, index);
+                });
+            }
+
+            // 更新统计信息
+            updateStats(result.count, result.inference_time, this.currentFps);
+            updateResultsList(result.faces);
         } catch (error) {
-            this.isDetecting = false;
+            // 首次错误弹窗提示，后续静默避免频繁打扰
             if (!this._hasShownError) {
                 this._hasShownError = true;
-                showToast(`帧捕获异常: ${error.message}`, 'error', 5000);
+                showToast(`检测异常: ${error.message}`, 'error', 5000);
                 setTimeout(() => { this._hasShownError = false; }, 5000);
             }
-            console.warn('帧捕获失败:', error.message);
         }
-    },
-
-    /**
-     * 处理WebSocket异步返回的检测结果并绘制到叠加Canvas
-     *
-     * 由WSDetectClient.onResult回调触发，将服务端推送的检测结果
-     * 绘制到摄像头视频上方的叠加层。由于WebSocket的异步特性，
-     * 结果到达时间与发送时间不完全对应，始终绘制最新收到的结果。
-     *
-     * @param {Object} result - 服务端返回的检测结果对象
-     * @param {Array} result.faces - 人脸列表，每项包含bbox和confidence
-     * @param {number} result.count - 人脸数量
-     * @param {number} result.inference_time - 推理耗时(ms)
-     * @returns {void}
-     *
-     * @notes
-     *   - 坐标映射逻辑与原HTTP模式一致（镜像翻转 + 缩放 + 偏移）
-     *   - 统计信息在此处更新（替代原来detectFrame内的同步更新）
-     */
-    _handleWSResult(result) {
-        // 调试日志
-        console.log('[Camera] WS检测结果:', result.count, '张人脸', result.faces?.length > 0 ? result.faces : '无');
-
-        // === 计算视频在容器中的实际显示尺寸和偏移 ===
-        const container = document.getElementById('canvasContainer');
-        const containerW = container.clientWidth;
-        const containerH = container.clientHeight;
-        const videoAspect = this.video.videoWidth / this.video.videoHeight;
-        const containerAspect = containerW / containerH;
-
-        let displayW, displayH, offsetX, offsetY;
-        if (videoAspect > containerAspect) {
-            // 视频更宽：以容器宽度为准，高度留白
-            displayW = containerW;
-            displayH = containerW / videoAspect;
-            offsetX = 0;
-            offsetY = (containerH - displayH) / 2;
-        } else {
-            // 视频更高：以容器高度为准，宽度留白
-            displayH = containerH;
-            displayW = containerH * videoAspect;
-            offsetX = (containerW - displayW) / 2;
-            offsetY = 0;
-        }
-
-        // 缩放比例：原图坐标 → 显示坐标
-        const scaleX = displayW / this.video.videoWidth;
-        const scaleY = displayH / this.video.videoHeight;
-
-        // === 清空并重绘叠加层 ===
-        this.ctx.clearRect(0, 0, containerW, containerH);
-
-        // === 绘制检测结果 ===
-        if (result.faces && result.faces.length > 0) {
-            result.faces.forEach((face, index) => {
-                const [x1, y1, x2, y2] = face.bbox;
-
-                // 原图坐标 → 显示坐标（缩放）
-                let sx = x1 * scaleX;
-                let sy = y1 * scaleY;
-                let sw = (x2 - x1) * scaleX;
-                let sh = (y2 - y1) * scaleY;
-
-                // 关键修复：X轴镜像翻转
-                // 视频CSS做了scaleX(-1)，所以检测框x也要翻转才能对齐
-                sx = offsetX + displayW - (sx + sw);
-                // sy 不变，Y轴无镜像
-
-                // 绘制单个检测框
-                this._drawSingleBox(sx, sy, sw, sh, face.confidence, index);
-            });
-        }
-
-        // 更新统计
-        updateStats(result.count, result.inference_time, this.currentFps);
-        updateResultsList(result.faces);
     },
 
     /**
