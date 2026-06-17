@@ -95,38 +95,77 @@ class DetectRequest(BaseModel):
 
 class HealthResponse(BaseModel):
     """
-    健康检查响应模型
+    Health check response model
 
     Attributes:
-        status: 服务状态
-        model_loaded: 模型是否已加载
-        device: 推理设备
+        status: Service status
+        model_loaded: Whether model is loaded
+        device: Current inference device
+        cuda_available: Whether CUDA/GPU is available on this machine
     """
     status: str
     model_loaded: bool
     device: str = "unknown"
+    cuda_available: bool = False
+
+
+class DeviceSwitchRequest(BaseModel):
+    """
+    Device switch request model
+
+    Attributes:
+        device: Target device, 'cpu' or 'cuda'
+    """
+    device: str = Field(..., description="Target inference device: 'cpu' or 'cuda'")
 
 
 # ============================================================
 # API接口
 # ============================================================
-@app.get("/api/health", response_model=HealthResponse, summary="健康检查")
+@app.get("/api/health", response_model=HealthResponse, summary="Health check")
 async def health_check():
     """
-    服务健康检查接口
+    Health check endpoint with device info
 
     Returns:
-        HealthResponse: 包含服务状态、模型加载状态和推理设备信息
-
-    Notes:
-        - 可用于前端检测后端服务是否可用
-        - 模型未加载时仍返回200，但model_loaded为False
+        HealthResponse: Service status, model state, current device, CUDA availability
     """
+    cuda_avail = False
+    try:
+        import torch
+        cuda_avail = torch.cuda.is_available()
+    except ImportError:
+        pass
+
     return HealthResponse(
         status="ok",
         model_loaded=detector is not None,
-        device=detector.device if detector else "unknown"
+        device=detector.device if detector else "unknown",
+        cuda_available=cuda_avail
     )
+
+
+@app.post("/api/device", summary="Switch inference device")
+async def switch_device(request: DeviceSwitchRequest):
+    """
+    Switch inference device between CPU and GPU at runtime
+
+    Args:
+        request: Device switch request with target device ('cpu' or 'cuda')
+
+    Returns:
+        dict: Switch result with success status, current device, and message
+
+    Raises:
+        HTTPException: Model not loaded (503), or invalid device (400)
+    """
+    if detector is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    result = detector.switch_device(request.device)
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
 
 
 @app.post("/api/detect/image", summary="图片人脸检测")
@@ -284,8 +323,16 @@ async def websocket_detect(websocket: WebSocket):
                             "conf_threshold": conf_threshold,
                             "iou_threshold": iou_threshold
                         })
+                    elif config.get("type") == "device":
+                        # Handle device switch via WebSocket
+                        target = config.get("device", "")
+                        result = detector.switch_device(target)
+                        await safe_send({
+                            "type": "device_ack",
+                            **result
+                        })
                 except (json.JSONDecodeError, TypeError):
-                    await safe_send({"type": "error", "detail": "Invalid config message format"})
+                    await safe_send({"type": "error", "detail": "Invalid message format"})
                 continue
 
             # 处理二进制帧数据

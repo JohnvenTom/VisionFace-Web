@@ -109,14 +109,10 @@ class FaceDetector:
 
     def _detect_device(self) -> str:
         """
-        自动检测可用的推理设备
+        Auto-detect available inference device
 
         Returns:
-            str: 推理设备标识，'cuda'表示GPU，'cpu'表示CPU
-
-        Notes:
-            - 优先使用GPU，不可用时回退到CPU
-            - 通过Ultralytics内部机制检测CUDA可用性
+            str: 'cuda' if GPU available, otherwise 'cpu'
         """
         try:
             import torch
@@ -125,6 +121,68 @@ class FaceDetector:
         except ImportError:
             pass
         return "cpu"
+
+    def switch_device(self, target_device: str) -> dict:
+        """
+        Switch inference device at runtime (CPU <-> GPU)
+
+        Validates the target device availability before switching.
+        Switching to CUDA requires PyTorch with CUDA support installed.
+
+        Args:
+            target_device: Target device identifier, 'cuda' or 'cpu'
+
+        Returns:
+            dict: Result with keys:
+                - success (bool): Whether the switch succeeded
+                - device (str): The actual device after switching
+                - message (str): Human-readable status message
+
+        Notes:
+            - Switching to 'cuda' will fail gracefully if CUDA is unavailable
+            - Model weights remain loaded; only the inference device changes
+            - Safe to call repeatedly (no-op if already on target device)
+        """
+        target = target_device.lower().strip()
+
+        if target == self.device:
+            return {
+                "success": True,
+                "device": self.device,
+                "message": f"Already running on {self.device.upper()}"
+            }
+
+        if target == "cuda":
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    return {
+                        "success": False,
+                        "device": self.device,
+                        "message": "CUDA not available. Install PyTorch with CUDA support."
+                    }
+            except ImportError:
+                return {
+                    "success": False,
+                    "device": self.device,
+                    "message": "PyTorch not installed or CUDA not available."
+                }
+        elif target != "cpu":
+            return {
+                "success": False,
+                "device": self.device,
+                "message": f"Invalid device '{target}'. Use 'cpu' or 'cuda'."
+            }
+
+        # Perform the switch
+        old_device = self.device
+        self.device = target
+        print(f"[FaceDetector] Device switched: {old_device} → {self.device}")
+        return {
+            "success": True,
+            "device": self.device,
+            "message": f"Switched from {old_device} to {self.device.upper()}"
+        }
 
     def detect(
         self,

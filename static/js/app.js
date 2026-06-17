@@ -30,16 +30,17 @@ const App = {
      *   - 服务状态检查失败不影响页面基本功能
      */
     init() {
-        // 初始化子模块
+        // Initialize sub-modules
         ImageDetector.init();
         CameraDetector.init();
 
-        // 绑定全局事件
+        // Bind global events
         this.bindModeSwitch();
         this.bindParamSliders();
         this.bindResetButton();
+        this.bindDeviceSwitch();
 
-        // 检查服务状态（立即执行一次，之后每30秒轮询）
+        // Check server status (immediately + every 30s)
         this.checkServerStatus();
         setInterval(() => this.checkServerStatus(), 30000);
     },
@@ -182,30 +183,128 @@ const App = {
      *   - 模型未加载时显示黄色警告状态
      *   - 每30秒自动刷新一次状态
      */
+    /**
+     * Bind device switch (CPU/GPU) click events
+     *
+     * Sends a POST request to /api/device to switch inference device.
+     * Updates chip active state, status pill, and hint text accordingly.
+     *
+     * @returns {void}
+     */
+    bindDeviceSwitch() {
+        const btnCpu = document.getElementById('btnDeviceCpu');
+        const btnGpu = document.getElementById('btnDeviceGpu');
+        const hint   = document.getElementById('deviceHint');
+
+        const switchTo = async (targetDevice) => {
+            // Prevent double-click on already-active
+            if ((targetDevice === 'cpu' && btnCpu.classList.contains('active')) ||
+                (targetDevice === 'cuda' && btnGpu.classList.contains('active'))) {
+                return;
+            }
+
+            try {
+                hint.textContent = 'Switching...';
+                const res = await fetch('/api/device', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device: targetDevice })
+                });
+                const data = await res.json();
+
+                if (!res.ok) {
+                    hint.textContent = data.detail || 'Switch failed';
+                    showToast(data.detail || 'Device switch failed', 'error');
+                    return;
+                }
+
+                // Update chip states
+                btnCpu.classList.toggle('active', targetDevice === 'cpu');
+                btnGpu.classList.toggle('active', targetDevice === 'cuda');
+
+                // Update status pill
+                this._updateDevicePill(targetDevice);
+
+                hint.textContent = data.message || `Now on ${targetDevice.toUpperCase()}`;
+                showToast(`Device: ${data.message || targetDevice.toUpperCase()}`, 'success');
+            } catch (err) {
+                hint.textContent = 'Request failed';
+                showToast(`Device switch error: ${err.message}`, 'error');
+            }
+        };
+
+        btnCpu.addEventListener('click', () => switchTo('cpu'));
+        btnGpu.addEventListener('click', () => switchTo('cuda'));
+    },
+
+    /**
+     * Update the Device status pill color and label
+     *
+     * @param {string} device - Current device identifier ('cpu' or 'cuda')
+     * @returns {void}
+     */
+    _updateDevicePill(device) {
+        const devicePill = document.getElementById('deviceStatus');
+        const deviceLabel = devicePill.querySelector('span:last-child');
+        deviceLabel.textContent = device === 'cuda' ? 'GPU' : 'CPU';
+        // Color is handled by checkServerStatus via health.device
+    },
+
     async checkServerStatus() {
-        const serverDot = document.querySelector('#serverStatus .status-dot');
-        const modelDot = document.querySelector('#modelStatus .status-dot');
-        const deviceLabel = document.querySelector('#deviceStatus .status-label');
+        const serverPill = document.getElementById('serverStatus');
+        const modelPill  = document.getElementById('modelStatus');
+        const devicePill = document.getElementById('deviceStatus');
+        const serverDot = serverPill.querySelector('.dot');
+        const modelDot  = modelPill.querySelector('.dot');
+        const deviceLabel = devicePill.querySelector('span:last-child');
+
+        // Device switcher elements
+        const btnCpu = document.getElementById('btnDeviceCpu');
+        const btnGpu = document.getElementById('btnDeviceGpu');
+        const hint   = document.getElementById('deviceHint');
 
         try {
             const health = await checkHealth();
 
-            // 服务器在线
-            serverDot.className = 'status-dot online';
+            // Server online — green
+            serverPill.className = 'status-pill ok';
+            serverDot.className = 'dot';
 
-            // 模型状态
+            // Model status
             if (health.model_loaded) {
-                modelDot.className = 'status-dot online';
+                modelPill.className = 'status-pill ok';
+                modelDot.className = 'dot';
             } else {
-                modelDot.className = 'status-dot loading';
+                modelPill.className = 'status-pill warn';
+                modelDot.className = 'dot';
             }
 
-            // 设备信息
-            deviceLabel.textContent = health.device === 'cuda' ? 'GPU加速' : 'CPU推理';
+            // Device info — update pill label + sync switcher chips
+            const currentDevice = health.device || 'cpu';
+            deviceLabel.textContent = currentDevice === 'cuda' ? 'GPU' : 'CPU';
+
+            // Sync device switcher chips with actual backend state
+            if (btnCpu && btnGpu) {
+                btnCpu.classList.toggle('active', currentDevice === 'cpu');
+                btnGpu.classList.toggle('active', currentDevice === 'cuda');
+
+                // Enable/disable GPU button based on CUDA availability
+                if (health.cuda_available) {
+                    btnGpu.disabled = false;
+                    if (!hint.textContent || hint.textContent.includes('not available')) {
+                        hint.textContent = '';
+                    }
+                } else {
+                    btnGpu.disabled = true;
+                    hint.textContent = 'GPU unavailable (no CUDA)';
+                }
+            }
         } catch (error) {
-            serverDot.className = 'status-dot offline';
-            modelDot.className = 'status-dot offline';
-            deviceLabel.textContent = '服务离线';
+            serverPill.className = 'status-pill err';
+            serverDot.className = 'dot';
+            modelPill.className = 'status-pill err';
+            modelDot.className = 'dot';
+            deviceLabel.textContent = 'Offline';
         }
     }
 };
