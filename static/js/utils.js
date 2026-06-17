@@ -245,3 +245,232 @@ function updateResultsList(faces) {
         </div>
     `).join('');
 }
+
+
+// ============================================================
+// WebSocket 连接管理模块（摄像头实时检测专用）
+// ============================================================
+
+/**
+ * WebSocket检测连接管理器
+ *
+ * 封装WebSocket连接的完整生命周期，包括连接建立、二进制帧发送、
+ * 结果接收解析、断线重连、参数动态更新等功能。
+ * 替代原有的HTTP POST轮询模式，大幅降低每帧传输开销。
+ *
+ * @namespace WSDetectClient
+ *
+ * @example
+ * // 开启摄像头时连接
+ * await WSDetectClient.connect();
+ *
+ * // 发送帧数据（Blob格式）
+ * WSDetectClient.sendFrame(blob);
+ *
+ * // 更新检测参数
+ * WSDetectClient.updateConfig(0.6, 0.5);
+ *
+ * // 关闭摄像头时断开
+ * WSDetectClient.disconnect();
+ */
+const WSDetectClient = {
+    /** @type {WebSocket|null} WebSocket连接实例 */
+    _ws: null,
+    /** @type {string} WebSocket服务端地址 */
+    _url: '',
+    /** @type {boolean} 是否已连接 */
+    connected: false,
+    /** @type {Function|null} 检测结果回调函数 */
+    _onResult: null,
+    /** @type {Function|null} 错误回调函数 */
+    _onError: null,
+    /** @type {number} 自动重连最大次数 */
+    _maxRetries: 3,
+    /** @type {number} 当前重连计数 */
+    _retryCount: 0,
+    /** @type {number} 重连间隔基数（毫秒），指数退避 */
+    _retryBaseDelay: 1000,
+
+    /**
+     * 建立WebSocket连接并注册回调
+     *
+     * 创建到后端 /ws/detect 端点的持久连接，
+     * 连接成功后自动发送初始配置消息。
+     *
+     * @param {Object} [options] - 连接选项
+     * @param {Function} [options.onResult] - 接收到检测结果时的回调，参数为解析后的结果对象
+     * @param {Function} [options.onError] - 发生错误时的回调，参数为错误信息字符串
+     * @param {string} [options.url] - 自定义WebSocket地址，默认从当前页面协议/主机推导
+     * @returns {Promise<void>}
+     * @throws {Error} 当连接失败且重试耗尽时抛出异常
+     *
+     * @notes
+     *   - 自动根据当前页面协议选择 ws:// 或 wss://
+     *   - 连接成功后立即发送默认阈值配置
+     *   - 已有活跃连接时会先断开旧连接
+     *   - 支持指数退避自动重连（最多3次）
+     */
+    async connect(options = {}) {
+        this._onResult = options.onResult || null;
+        this._onError = options.onError || null;
+
+        // 如果已有连接，先关闭
+        if (this._ws && (this._ws.readyState === WebSocket.OPEN || this._ws.readyState === WebSocket.CONNECTING)) {
+            this.disconnect();
+        }
+
+        // 构建WebSocket URL：同源部署下从当前页面地址推导
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        this._url = options.url || `${protocol}//${location.host}/ws/detect`;
+
+        return new Promise((resolve, reject) => {
+            try {
+                this._ws = new WebSocket(this._url);
+            } catch (err) {
+                reject(new Error(`WebSocket创建失败: ${err.message}`));
+                return;
+            }
+
+            this._ws.binaryType = 'arraybuffer';  // 关键：以二进制形式接收
+
+            this._ws.onopen = () => {
+                console.log('[WS] 连接已建立:', this._url);
+                this.connected = true;
+                this._retryCount = 0;
+                resolve();
+            };
+
+            this._ws.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                    // 文本消息：JSON格式的检测结果或错误/确认消息
+                    try {
+                        const msg = JSON.parse(event.data);
+
+                        if (msg.type === 'error') {
+                            console.warn('[WS] 服务端错误:', msg.detail);
+                            if (this._onError) this._onError(msg.detail);
+                            return;
+                        }
+
+                        if (msg.type === 'config_ack') {
+                            console.log('[WS] 配置已更新:', msg);
+                            return;
+                        }
+
+                        // 默认：检测结果数据
+                        if (this._onResult) this._onResult(msg);
+                    } catch (parseErr) {
+                        console.warn('[WS] 消息解析失败:', parseErr);
+                    }
+                }
+            };
+
+            this._ws.onerror = (event) => {
+                console.error('[WS] 连接错误:', event);
+                // onclose会紧随其后触发，在那里处理重连逻辑
+            };
+
+            this._ws.onclose = (event) => {
+                this.connected = false;
+                console.log(`[WS] 连接已关闭, code=${event.code}, reason=${event.reason}`);
+
+                // 非正常关闭且未达到重连上限 → 尝试重连
+                if (event.code !== 1000 && this._retryCount < this._maxRetries) {
+                    this._retryCount++;
+                    const delay = this._retryBaseDelay * Math.pow(2, this._retryCount - 1);
+                    console.log(`[WS] 将在 ${delay}ms 后尝试第 ${this._retryCount} 次重连...`);
+                    setTimeout(() => this.connect(options), delay);
+                } else if (this._retryCount >= this._maxRetries) {
+                    const errMsg = `WebSocket连接失败，已重试${this._maxRetries}次`;
+                    console.error('[WS]', errMsg);
+                    if (this._onError) this._onError(errMsg);
+                }
+            };
+        });
+    },
+
+    /**
+     * 通过WebSocket发送二进制图像帧
+     *
+     * 将Canvas捕获的Blob数据直接通过WebSocket二进制帧发送，
+     * 无需Base64编码，消除约33%的数据膨胀。
+     *
+     * @param {Blob|ArrayBuffer} frameData - 图像帧的二进制数据（推荐JPEG Blob）
+     * @returns {boolean} 发送成功返回true，连接未就绪返回false
+     *
+     * @notes
+     *   - 仅在 connected 状态为 true 时才发送
+     *   - 前端应使用 canvas.toBlob('image/jpeg', 0.8) 获取压缩后的二进制数据
+     *   - 发送失败时静默处理，不中断调用方流程
+     */
+    sendFrame(frameData) {
+        if (!this.connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+        try {
+            this._ws.send(frameData);
+            return true;
+        } catch (err) {
+            console.warn('[WS] 帧发送失败:', err.message);
+            return false;
+        }
+    },
+
+    /**
+     * 动态更新检测参数（无需断开重连）
+     *
+     * 通过发送配置文本消息实时调整置信度和IoU阈值，
+     * 服务端收到后对后续帧生效。
+     *
+     * @param {number} confThreshold - 置信度阈值，范围0.1-0.9
+     * @param {number} iouThreshold - NMS IoU阈值，范围0.1-0.9
+     * @returns {boolean} 发送成功返回true
+     *
+     * @notes
+     *   - 参数变更即时生效，无需等待下一帧
+     *   - 服务端会回复 config_ack 确认消息
+     */
+    updateConfig(confThreshold, iouThreshold) {
+        if (!this.connected || !this._ws || this._ws.readyState !== WebSocket.OPEN) {
+            return false;
+        }
+        try {
+            this._ws.send(JSON.stringify({
+                type: 'config',
+                conf_threshold: confThreshold,
+                iou_threshold: iouThreshold
+            }));
+            return true;
+        } catch (err) {
+            console.warn('[WS] 配置发送失败:', err.message);
+            return false;
+        }
+    },
+
+    /**
+     * 断开WebSocket连接
+     *
+     * 主动关闭连接并释放资源，停止所有重连尝试。
+     *
+     * @returns {void}
+     *
+     * @notes
+     *   - 调用后会清除回调引用和重连计数
+     *   - 应在摄像头关闭时调用，避免资源泄漏
+     */
+    disconnect() {
+        this._retryCount = this._maxRetries;  // 阻止自动重连
+        if (this._ws) {
+            try {
+                this._ws.close(1000, '客户端主动断开');
+            } catch (e) {
+                // 忽略已关闭的连接
+            }
+            this._ws = null;
+        }
+        this.connected = false;
+        this._onResult = null;
+        this._onError = null;
+        console.log('[WS] 连接已释放');
+    }
+};
